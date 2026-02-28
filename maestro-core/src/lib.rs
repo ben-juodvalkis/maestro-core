@@ -30,8 +30,10 @@ pub mod beat_tracker;
 // Step 4: Control parameters — tempo and pitch
 pub mod tempo;
 pub mod pitch;
-// pub mod pcm_cache;
-// pub mod track;
+
+// Step 5: Track data model + PCM cache
+pub mod pcm_cache;
+pub mod track;
 // pub mod mixer;
 // pub mod transport;
 // pub mod events;
