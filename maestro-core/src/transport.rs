@@ -345,9 +345,12 @@ impl TransportController {
                     }
                 }
                 TransportState::Paused => {
-                    // Resume from paused (auto-start flag doesn't apply here)
-                    self.state = TransportState::Playing;
-                    TransportAction::Resume
+                    if flags.allow_auto_start {
+                        self.state = TransportState::Playing;
+                        TransportAction::Resume
+                    } else {
+                        TransportAction::None
+                    }
                 }
                 TransportState::Playing => TransportAction::None,
             }
@@ -782,8 +785,19 @@ mod tests {
         }
 
         #[test]
-        fn first_track_from_paused_always_resumes() {
+        fn first_track_from_paused_respects_preset() {
+            // SliderOperation has allow_auto_start=false → should NOT resume
             let mut tc = with_preset(SafetyPreset::SliderOperation);
+            tc.force_state(TransportState::Paused);
+            let action = tc.on_track_started("drums");
+            assert_eq!(action, TransportAction::None);
+            assert_eq!(tc.state(), TransportState::Paused);
+        }
+
+        #[test]
+        fn first_track_from_paused_resumes_when_allowed() {
+            // TrackInteraction has allow_auto_start=true → should resume
+            let mut tc = with_preset(SafetyPreset::TrackInteraction);
             tc.force_state(TransportState::Paused);
             let action = tc.on_track_started("drums");
             assert_eq!(action, TransportAction::Resume);

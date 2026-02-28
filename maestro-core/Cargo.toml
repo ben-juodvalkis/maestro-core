@@ -22,9 +22,6 @@ js-sys = { version = "0.3", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
 
-# Future steps will add:
-# symphonia = { version = "0.5", features = ["all-codecs", "all-formats"] }  # audio decoding
-# uniffi = { version = "0.28", features = ["cli"] }                          # Swift/Kotlin bindings
 
 [dev-dependencies]
 # No external test deps needed yet — std assertions suffice
@@ -40,8 +37,9 @@ opt-level = 3
 lto = true
 codegen-units = 1
 
-# WASM-specific release profile — strips debug symbols (not needed for web).
-# Native builds should NOT use strip=true to preserve Sentry stack traces.
+# WASM-specific release profile — strips debug symbols and panic unwinding
+# infrastructure. Native builds should NOT use this to preserve Sentry stack traces.
 [profile.release-wasm]
 inherits = "release"
 strip = true
+panic = "abort"

@@ -118,15 +118,16 @@ impl FifoBuffer {
 
     /// Add one or more frames to the back of the queue.
     ///
-    /// Returns `true` if the frames were added, `false` if the queue would
-    /// overflow (no frames are added in the overflow case).
-    pub fn add_frames(&mut self, frames: impl IntoIterator<Item = AudioFrame>) -> bool {
+    /// Returns the number of frames actually enqueued.  If the queue would
+    /// overflow, **no** frames are added and the return value is `0`.
+    /// Callers can compare this against the input length to detect drops.
+    pub fn add_frames(&mut self, frames: impl IntoIterator<Item = AudioFrame>) -> usize {
         let frames: Vec<AudioFrame> = frames.into_iter().collect();
         let count = frames.len();
 
         if self.queue.len() + count > self.max_queue_size {
             self.metrics.overflows += 1;
-            return false;
+            return 0;
         }
 
         for frame in frames {
@@ -136,11 +137,13 @@ impl FifoBuffer {
         if self.queue.len() > self.metrics.max_queue_depth {
             self.metrics.max_queue_depth = self.queue.len();
         }
-        true
+        count
     }
 
     /// Add a single frame to the back of the queue.
-    pub fn add_frame(&mut self, frame: AudioFrame) -> bool {
+    ///
+    /// Returns `1` if the frame was added, `0` if the queue is full.
+    pub fn add_frame(&mut self, frame: AudioFrame) -> usize {
         self.add_frames(std::iter::once(frame))
     }
 
@@ -231,7 +234,7 @@ mod tests {
     fn add_and_consume_single_frame() {
         let mut buf = FifoBuffer::with_defaults();
         let frame = make_stereo_frame(0.5);
-        assert!(buf.add_frame(frame));
+        assert_eq!(buf.add_frame(frame), 1);
         assert_eq!(buf.queue_depth(), 1);
         assert!(buf.has_frames());
 
@@ -259,7 +262,7 @@ mod tests {
     fn add_multiple_frames() {
         let mut buf = FifoBuffer::with_defaults();
         let frames = vec![make_stereo_frame(0.1), make_stereo_frame(0.2)];
-        assert!(buf.add_frames(frames));
+        assert_eq!(buf.add_frames(frames), 2);
         assert_eq!(buf.queue_depth(), 2);
     }
 
@@ -268,11 +271,11 @@ mod tests {
     #[test]
     fn overflow_rejected() {
         let mut buf = FifoBuffer::new(3);
-        assert!(buf.add_frame(make_stereo_frame(1.0)));
-        assert!(buf.add_frame(make_stereo_frame(2.0)));
-        assert!(buf.add_frame(make_stereo_frame(3.0)));
+        assert_eq!(buf.add_frame(make_stereo_frame(1.0)), 1);
+        assert_eq!(buf.add_frame(make_stereo_frame(2.0)), 1);
+        assert_eq!(buf.add_frame(make_stereo_frame(3.0)), 1);
         // Queue is full — next add should fail
-        assert!(!buf.add_frame(make_stereo_frame(4.0)));
+        assert_eq!(buf.add_frame(make_stereo_frame(4.0)), 0);
         assert_eq!(buf.metrics().overflows, 1);
         assert_eq!(buf.queue_depth(), 3);
     }

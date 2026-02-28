@@ -43,7 +43,23 @@ use crate::transport::{SafetyPreset, TransportState};
 
 impl From<EngineError> for JsValue {
     fn from(e: EngineError) -> Self {
-        JsValue::from_str(&e.to_string())
+        // Structured error with a `code` field so JS consumers can handle
+        // errors by type without string parsing.
+        let code = match &e {
+            EngineError::InvalidState { .. } => "InvalidState",
+            EngineError::InvalidStateTransition { .. } => "InvalidStateTransition",
+            EngineError::TrackNotFound(_) => "TrackNotFound",
+            EngineError::TrackAlreadyExists(_) => "TrackAlreadyExists",
+            EngineError::Tempo(_) => "Tempo",
+            EngineError::Pitch(_) => "Pitch",
+            EngineError::Mixer(_) => "Mixer",
+            EngineError::Track(_) => "Track",
+        };
+        let json = serde_json::json!({
+            "code": code,
+            "message": e.to_string(),
+        });
+        JsValue::from_str(&json.to_string())
     }
 }
 
@@ -199,7 +215,7 @@ fn engine_event_to_json(event: &EngineEvent) -> serde_json::Value {
         }),
         EngineEvent::TransportChanged { state } => serde_json::json!({
             "type": "transport:changed",
-            "state": format!("{:?}", state),
+            "state": state.to_string(),
         }),
         EngineEvent::TempoChanged { tempo, previous_tempo } => serde_json::json!({
             "type": "tempo:changed",
@@ -217,8 +233,8 @@ fn engine_event_to_json(event: &EngineEvent) -> serde_json::Value {
         EngineEvent::TrackStateChanged { track_id, state, previous_state } => serde_json::json!({
             "type": "track:stateChanged",
             "trackId": track_id,
-            "state": format!("{:?}", state),
-            "previousState": format!("{:?}", previous_state),
+            "state": state.to_string(),
+            "previousState": previous_state.to_string(),
         }),
         EngineEvent::TrackLoaded { track_id } => serde_json::json!({
             "type": "track:loaded",
@@ -685,7 +701,7 @@ impl WasmMaestroEngine {
             Some(info) => {
                 let json = serde_json::json!({
                     "id": info.id,
-                    "status": format!("{:?}", info.status),
+                    "status": info.status.to_string(),
                     "armed": info.armed,
                     "volume": info.volume,
                     "pitchCents": info.pitch_cents,
@@ -712,7 +728,7 @@ impl WasmMaestroEngine {
             .map(|info| {
                 serde_json::json!({
                     "id": info.id,
-                    "status": format!("{:?}", info.status),
+                    "status": info.status.to_string(),
                     "armed": info.armed,
                     "volume": info.volume,
                     "pitchCents": info.pitch_cents,

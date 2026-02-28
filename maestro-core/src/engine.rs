@@ -330,7 +330,9 @@ impl MaestroEngine {
 
         // Register in tempo controller if original tempo provided
         if let Some(tempo) = original_tempo {
-            let _ = self.tempo.register_track(id, tempo);
+            self.tempo
+                .register_track(id, tempo)
+                .map_err(|e| EngineError::Tempo(e.to_string()))?;
         }
 
         // Advance state if this is the first track
@@ -702,7 +704,9 @@ impl MaestroEngine {
             .map_err(|e| EngineError::Track(e.to_string()))?;
 
         // Reset position
-        let _ = track.set_position(0.0);
+        track
+            .set_position(0.0)
+            .map_err(|e| EngineError::Track(e.to_string()))?;
 
         // Notify transport
         let action = self.transport.on_track_stopped(track_id);

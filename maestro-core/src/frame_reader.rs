@@ -434,7 +434,7 @@ impl FrameReader {
 
         for _ in 0..count {
             if let Some(frame) = self.read_next_frame() {
-                if fifo.add_frame(frame) {
+                if fifo.add_frame(frame) > 0 {
                     delivered += 1;
                 } else {
                     break; // FIFO full
