@@ -34,8 +34,10 @@ pub mod pitch;
 // Step 5: Track data model + PCM cache
 pub mod pcm_cache;
 pub mod track;
-// pub mod mixer;
-// pub mod transport;
+
+// Step 6: Mixing and transport state machine
+pub mod mixer;
+pub mod transport;
 // pub mod events;
 // pub mod engine;
 // pub mod music_library;
