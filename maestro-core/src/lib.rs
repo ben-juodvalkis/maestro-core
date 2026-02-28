@@ -38,7 +38,9 @@ pub mod track;
 // Step 6: Mixing and transport state machine
 pub mod mixer;
 pub mod transport;
-// pub mod events;
-// pub mod engine;
+
+// Step 7: Orchestration layer — events and engine
+pub mod events;
+pub mod engine;
 // pub mod music_library;
 // pub mod ffi;
