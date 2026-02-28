@@ -47,5 +47,5 @@ pub mod engine;
 // Feature-gated: `native-stretch` for native targets, stub for WASM
 pub mod stretch;
 
-// pub mod music_library;
-// pub mod ffi;
+// Step 9: Foreign Function Interface — wasm-bindgen exports (web) and UniFFI (native, future)
+pub mod ffi;

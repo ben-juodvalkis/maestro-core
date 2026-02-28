@@ -15,10 +15,16 @@ crate-type = ["lib", "cdylib", "staticlib"]
 # Uses colinmarc's crate: bindgen + cc compiles the C++ header-only library
 signalsmith-stretch = { version = "0.1", optional = true }
 
+# Step 9: WASM exports via wasm-bindgen
+# Feature-gated: only compiled for wasm32 targets
+wasm-bindgen = { version = "0.2", optional = true }
+js-sys = { version = "0.3", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+
 # Future steps will add:
 # symphonia = { version = "0.5", features = ["all-codecs", "all-formats"] }  # audio decoding
 # uniffi = { version = "0.28", features = ["cli"] }                          # Swift/Kotlin bindings
-# wasm-bindgen = "0.2"                                                       # WASM exports
 
 [dev-dependencies]
 # No external test deps needed yet — std assertions suffice
@@ -26,7 +32,7 @@ signalsmith-stretch = { version = "0.1", optional = true }
 [features]
 default = ["native-stretch"]
 native-stretch = ["signalsmith-stretch"]  # Step 8: native C++ time-stretching
-wasm = []  # Future: wasm-bindgen exports
+wasm = ["wasm-bindgen", "js-sys", "serde", "serde_json"]  # Step 9: wasm-bindgen exports
 
 [profile.release]
 opt-level = 3
