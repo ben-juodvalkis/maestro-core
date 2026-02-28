@@ -26,8 +26,10 @@ pub mod frame_reader;
 // Step 3: Position calculation and beat tracking (depends on timing + frame reader)
 pub mod position;
 pub mod beat_tracker;
-// pub mod tempo;
-// pub mod pitch;
+
+// Step 4: Control parameters — tempo and pitch
+pub mod tempo;
+pub mod pitch;
 // pub mod pcm_cache;
 // pub mod track;
 // pub mod mixer;
