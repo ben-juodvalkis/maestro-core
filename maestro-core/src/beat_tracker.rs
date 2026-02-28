@@ -297,7 +297,9 @@ impl BeatDetector {
         let aligned_beat = target_beat.round();
         let is_on_subdivision = MUSICAL_SUBDIVISIONS.iter().any(|&sub| {
             let remainder = target_beat % sub;
-            remainder.abs() < ALIGNMENT_TOLERANCE || (sub - remainder).abs() < ALIGNMENT_TOLERANCE
+            // Use the minimum distance to the nearest subdivision boundary,
+            // handling floating-point edge cases where remainder is slightly negative
+            remainder.abs().min((sub - remainder).abs()) < ALIGNMENT_TOLERANCE
         });
 
         BeatValidation {

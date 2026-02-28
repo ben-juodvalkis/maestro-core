@@ -405,7 +405,9 @@ impl MaestroEngine {
             .map_err(|e| EngineError::Track(e.to_string()))?;
 
         // Set track duration from loaded data
-        let _ = track.set_duration(duration);
+        track
+            .set_duration(duration)
+            .map_err(|e| EngineError::Track(e.to_string()))?;
 
         // Transition to Ready
         track
@@ -426,7 +428,7 @@ impl MaestroEngine {
             self.events.push(EngineEvent::AllTracksLoaded);
             // Advance to Ready state if needed
             if self.state == EngineState::EnginesReady {
-                let _ = self.transition_state(EngineState::Ready);
+                self.transition_state(EngineState::Ready)?;
             }
         }
 
@@ -1160,7 +1162,7 @@ impl MaestroEngine {
                 EngineState::ServicesReady => 2,
                 EngineState::EnginesReady => 3,
                 EngineState::Ready => 4,
-                EngineState::Suspended => 3, // Same level as EnginesReady
+                EngineState::Suspended => 4, // Post-Ready state — operations valid in Ready should work in Suspended
                 EngineState::Error => 0,
                 EngineState::Destroying => 0,
             }
@@ -1371,6 +1373,29 @@ mod tests {
 
         engine.resume().unwrap();
         assert_eq!(engine.state(), EngineState::Ready);
+    }
+
+    #[test]
+    fn operations_work_while_suspended() {
+        let mut engine = engine_with_track();
+        engine.suspend().unwrap();
+        assert_eq!(engine.state(), EngineState::Suspended);
+
+        // Operations requiring EnginesReady should succeed in Suspended state
+        // (Suspended is post-Ready, so it ranks >= EnginesReady)
+        engine.play(SafetyPreset::Permissive).unwrap();
+        assert!(engine.is_playing());
+
+        engine.pause().unwrap();
+        assert!(engine.is_paused());
+
+        engine.stop().unwrap();
+        assert!(engine.is_stopped());
+
+        // Track creation requires ServicesReady — should also work
+        engine
+            .create_track("extra", "url", None, Some(120.0))
+            .unwrap();
     }
 
     // -- Track management ------------------------------------------------
@@ -1768,7 +1793,7 @@ mod tests {
 
     #[test]
     fn get_track_info() {
-        let mut engine = engine_with_track();
+        let engine = engine_with_track();
         let info = engine.get_track_info("drums").unwrap();
         assert_eq!(info.id, "drums");
         assert_eq!(info.status, TrackStatus::Ready);

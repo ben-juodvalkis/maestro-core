@@ -32,10 +32,16 @@ serde_json = { version = "1", optional = true }
 [features]
 default = ["native-stretch"]
 native-stretch = ["signalsmith-stretch"]  # Step 8: native C++ time-stretching
-wasm = ["wasm-bindgen", "js-sys", "serde", "serde_json"]  # Step 9: wasm-bindgen exports
+json = ["serde", "serde_json"]            # JSON serialization for complex types
+wasm = ["wasm-bindgen", "js-sys", "json"] # Step 9: wasm-bindgen exports (includes json)
 
 [profile.release]
 opt-level = 3
 lto = true
 codegen-units = 1
+
+# WASM-specific release profile — strips debug symbols (not needed for web).
+# Native builds should NOT use strip=true to preserve Sentry stack traces.
+[profile.release-wasm]
+inherits = "release"
 strip = true
