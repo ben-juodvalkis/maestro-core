@@ -42,5 +42,10 @@ pub mod transport;
 // Step 7: Orchestration layer — events and engine
 pub mod events;
 pub mod engine;
+
+// Step 8: Signalsmith Stretch — native C++ time-stretching and pitch-shifting
+// Feature-gated: `native-stretch` for native targets, stub for WASM
+pub mod stretch;
+
 // pub mod music_library;
 // pub mod ffi;

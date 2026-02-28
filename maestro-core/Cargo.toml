@@ -10,17 +10,22 @@ name = "maestro_core"
 crate-type = ["lib", "cdylib", "staticlib"]
 
 [dependencies]
-# Phase 1 — no external deps for pure-math modules (timing, beat_timeline)
+# Step 8: Signalsmith Stretch — native C++ time-stretching and pitch-shifting
+# Feature-gated: only compiled for native targets (not WASM — web uses existing JS/WASM pipeline)
+# Uses colinmarc's crate: bindgen + cc compiles the C++ header-only library
+signalsmith-stretch = { version = "0.1", optional = true }
+
 # Future steps will add:
-# symphonia = { version = "0.5", features = ["all-codecs", "all-formats"] }  # Step 5: audio decoding
-# uniffi = { version = "0.28", features = ["cli"] }                          # Step 7: Swift/Kotlin bindings
-# wasm-bindgen = "0.2"                                                       # Step 9: WASM exports
+# symphonia = { version = "0.5", features = ["all-codecs", "all-formats"] }  # audio decoding
+# uniffi = { version = "0.28", features = ["cli"] }                          # Swift/Kotlin bindings
+# wasm-bindgen = "0.2"                                                       # WASM exports
 
 [dev-dependencies]
 # No external test deps needed yet — std assertions suffice
 
 [features]
-default = []
+default = ["native-stretch"]
+native-stretch = ["signalsmith-stretch"]  # Step 8: native C++ time-stretching
 wasm = []  # Future: wasm-bindgen exports
 
 [profile.release]
