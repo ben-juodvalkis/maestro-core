@@ -1,0 +1,277 @@
+//! Shared test utilities for the native-rebuild validation suite (spec §6).
+//!
+//! - `reference` — exact `num-bigint` mirror of the §3.1 formulas
+//! - WAV fixture loading (32-bit float RIFF, Logic Pro JUNK-chunk tolerant)
+//! - `detect_click_onsets` — promoted from the abandoned branch per the
+//!   spec §7 reuse map; also used by the `maestro-validate` device CLI
+//! - the T-INV scenario runner driving the real `AudioCore` render entry
+
+#![allow(dead_code)] // each integration-test binary uses a subset
+
+pub mod reference;
+
+use std::fs::File;
+use std::io::Read;
+use std::path::PathBuf;
+
+use maestro_api::{Command, EngineConfig, LoadMeta};
+use maestro_core::audio_core::AudioCore;
+use maestro_core::control_plane::{create_engine, ControlPlane};
+
+pub const SAMPLE_RATE: u32 = 48_000;
+
+// ---------------------------------------------------------------------------
+// WAV fixtures
+// ---------------------------------------------------------------------------
+
+pub struct LoadedWav {
+    /// Per-channel PCM data, length = `frames`.
+    pub channels: Vec<Vec<f32>>,
+    pub sample_rate: u32,
+    pub num_channels: u32,
+    pub frames: usize,
+}
+
+pub fn fixture_path(name: &str) -> PathBuf {
+    let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    p.push("tests");
+    p.push("fixtures");
+    p.push(name);
+    p
+}
+
+/// Minimal RIFF/WAVE reader supporting 32-bit IEEE float PCM (format tag 3).
+/// Walks chunks so it handles `JUNK` blocks Logic Pro inserts before `fmt `.
+pub fn load_float_wav(path: &PathBuf) -> std::io::Result<LoadedWav> {
+    let mut f = File::open(path)?;
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf)?;
+
+    assert_eq!(&buf[0..4], b"RIFF", "{path:?}: not a RIFF file");
+    assert_eq!(&buf[8..12], b"WAVE", "{path:?}: not a WAVE file");
+
+    let mut pos: usize = 12;
+    let mut fmt_tag: u16 = 0;
+    let mut num_channels: u32 = 0;
+    let mut sample_rate: u32 = 0;
+    let mut bits_per_sample: u16 = 0;
+    let mut data_offset: usize = 0;
+    let mut data_size: usize = 0;
+
+    while pos + 8 <= buf.len() {
+        let cid = &buf[pos..pos + 4];
+        let csize = u32::from_le_bytes(buf[pos + 4..pos + 8].try_into().unwrap()) as usize;
+        let body = pos + 8;
+        match cid {
+            b"fmt " => {
+                fmt_tag = u16::from_le_bytes(buf[body..body + 2].try_into().unwrap());
+                num_channels = u16::from_le_bytes(buf[body + 2..body + 4].try_into().unwrap()) as u32;
+                sample_rate = u32::from_le_bytes(buf[body + 4..body + 8].try_into().unwrap());
+                bits_per_sample = u16::from_le_bytes(buf[body + 14..body + 16].try_into().unwrap());
+            }
+            b"data" => {
+                data_offset = body;
+                data_size = csize;
+                break;
+            }
+            _ => {}
+        }
+        pos = body + csize + (csize & 1);
+    }
+
+    assert_eq!(fmt_tag, 3, "{path:?}: expected IEEE float (tag 3), got {fmt_tag}");
+    assert_eq!(bits_per_sample, 32, "{path:?}: expected 32-bit float");
+    assert!(data_offset > 0 && data_size > 0, "{path:?}: missing data chunk");
+
+    let bytes_per_sample = (bits_per_sample / 8) as usize;
+    let frames = data_size / (num_channels as usize * bytes_per_sample);
+    let mut channels: Vec<Vec<f32>> =
+        (0..num_channels).map(|_| Vec::with_capacity(frames)).collect();
+
+    for frame in 0..frames {
+        for (ch, channel) in channels.iter_mut().enumerate() {
+            let off = data_offset + (frame * num_channels as usize + ch) * bytes_per_sample;
+            channel.push(f32::from_le_bytes(buf[off..off + 4].try_into().unwrap()));
+        }
+    }
+
+    Ok(LoadedWav { channels, sample_rate, num_channels, frames })
+}
+
+// ---------------------------------------------------------------------------
+// Click-onset detection (spec §7: promoted from the branch's
+// render_pipeline_integration.rs; reused by T-SEAM and maestro-validate)
+// ---------------------------------------------------------------------------
+
+/// Detect click onset frames in one channel. An onset is the first frame above
+/// `threshold` after a quiet gap of at least `min_gap_frames`.
+pub fn detect_click_onsets(channel: &[f32], threshold: f32, min_gap_frames: usize) -> Vec<usize> {
+    let mut onsets = Vec::new();
+    let mut last_onset: i64 = -(min_gap_frames as i64);
+    for (frame, s) in channel.iter().enumerate() {
+        if s.abs() > threshold && (frame as i64) - last_onset >= min_gap_frames as i64 {
+            onsets.push(frame);
+            last_onset = frame as i64;
+        }
+    }
+    onsets
+}
+
+// ---------------------------------------------------------------------------
+// T-INV scenario runner (spec §6.2)
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy)]
+pub struct ScenarioTrack {
+    pub o_mbpm: u32,
+    pub loop_beats: u32,
+    pub pcm_len: u64,
+    /// Sine frequency for the synthetic content (anti-stub RMS floor, §6.1).
+    pub sine_hz: f32,
+    pub pan: f32,
+}
+
+/// The §6.2 track set: O = {60k, 90k, 113k, 116k} mBPM with loop lengths from
+/// real metadata **including the non-integer musical-length cases (§2.2)** —
+/// Humboldt bass (815_575.221… exact) and San Francisco voice (2_085_517.241…
+/// exact). The 60/90 tracks use the metronome fixtures' exact-integer geometry.
+pub const T_INV_TRACKS: [ScenarioTrack; 4] = [
+    ScenarioTrack { o_mbpm: 60_000, loop_beats: 16, pcm_len: 768_000, sine_hz: 220.0, pan: -1.0 },
+    ScenarioTrack { o_mbpm: 90_000, loop_beats: 16, pcm_len: 512_000, sine_hz: 330.0, pan: 1.0 },
+    ScenarioTrack { o_mbpm: 113_000, loop_beats: 32, pcm_len: 815_576, sine_hz: 440.0, pan: -0.5 },
+    ScenarioTrack { o_mbpm: 116_000, loop_beats: 84, pcm_len: 2_085_518, sine_hz: 550.0, pan: 0.5 },
+];
+
+/// Block sizes alternate per render call (proves block-size independence).
+pub const T_INV_BLOCKS: [usize; 3] = [128, 480, 1024];
+
+pub struct Checkpoint {
+    /// True rendered frame count (tracked by the harness, NOT read from the
+    /// engine — so a sabotaged engine clock cannot fool the reference).
+    pub rendered_frames: u64,
+    /// Engine-reported dictated unwrapped positions per track.
+    pub positions: Vec<u64>,
+    /// Exact rational reference positions at `rendered_frames`.
+    pub reference: Vec<u64>,
+}
+
+pub struct ScenarioResult {
+    pub checkpoints: Vec<Checkpoint>,
+    /// Checkpoint entries where engine position != reference position.
+    pub position_mismatches: usize,
+    /// RMS of the rendered mix (anti-stub: silence fails, spec §6.1).
+    pub mix_rms: f64,
+}
+
+impl ScenarioResult {
+    /// Stable digest of the engine-reported checkpoint positions, for the
+    /// cross-platform parity comparison (spec §6.6): byte-for-byte equality
+    /// of these dumps is asserted across x86/ARM (and wasm32 from M4).
+    pub fn position_digest(&self) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325; // FNV-1a
+        for cp in &self.checkpoints {
+            for &p in std::iter::once(&cp.rendered_frames).chain(cp.positions.iter()) {
+                for byte in p.to_le_bytes() {
+                    h ^= byte as u64;
+                    h = h.wrapping_mul(0x1000_0000_01b3);
+                }
+            }
+        }
+        h
+    }
+}
+
+pub fn make_sine_pcm(len: u64, hz: f32) -> (Vec<f32>, Vec<f32>) {
+    let mut l = Vec::with_capacity(len as usize);
+    for n in 0..len {
+        let t = n as f32 / SAMPLE_RATE as f32;
+        l.push(0.25 * (2.0 * std::f32::consts::PI * hz * t).sin());
+    }
+    (l.clone(), l)
+}
+
+pub fn build_engine(tempo_mbpm: u32, tracks: &[ScenarioTrack]) -> (ControlPlane, Box<AudioCore>) {
+    let (mut plane, core) = create_engine(EngineConfig {
+        sample_rate: SAMPLE_RATE,
+        initial_tempo_mbpm: tempo_mbpm,
+        beats_per_bar: 4,
+    })
+    .expect("engine config valid");
+    for (slot, t) in tracks.iter().enumerate() {
+        let (l, r) = make_sine_pcm(t.pcm_len, t.sine_hz);
+        plane
+            .load_pcm(
+                &LoadMeta {
+                    slot: slot as u8,
+                    original_tempo_mbpm: t.o_mbpm,
+                    loop_beats: t.loop_beats,
+                    encoder_delay: 0,
+                    end_padding: 0,
+                    original_samples: t.pcm_len,
+                    gain: 1.0,
+                    pan: t.pan,
+                },
+                l,
+                r,
+            )
+            .expect("synthetic track loads");
+        let res = plane.dispatch(Command::Activate { slot: slot as u8 });
+        assert!(matches!(res, maestro_api::CommandResult::Ok), "activate rejected: {res:?}");
+    }
+    (plane, core)
+}
+
+/// Drive the real render entry for `total_frames`, checkpointing every
+/// `checkpoint_interval` frames against the bigint reference.
+pub fn run_t_inv_scenario(
+    total_frames: u64,
+    tempo_mbpm: u32,
+    checkpoint_interval: u64,
+) -> ScenarioResult {
+    let tracks = T_INV_TRACKS;
+    let (mut plane, mut core) = build_engine(tempo_mbpm, &tracks);
+    assert!(matches!(plane.dispatch(Command::Play), maestro_api::CommandResult::Ok));
+
+    let mut left = vec![0.0f32; *T_INV_BLOCKS.iter().max().unwrap()];
+    let mut right = vec![0.0f32; *T_INV_BLOCKS.iter().max().unwrap()];
+
+    let mut rendered: u64 = 0;
+    let mut next_checkpoint = checkpoint_interval;
+    let mut checkpoints = Vec::new();
+    let mut position_mismatches = 0usize;
+    let mut sumsq: f64 = 0.0;
+    let mut block_i = 0usize;
+
+    while rendered < total_frames {
+        let b = T_INV_BLOCKS[block_i % T_INV_BLOCKS.len()];
+        block_i += 1;
+        core.render(&mut left[..b], &mut right[..b]);
+        rendered += b as u64;
+        for i in 0..b {
+            sumsq += (left[i] as f64).powi(2) + (right[i] as f64).powi(2);
+        }
+
+        if rendered >= next_checkpoint {
+            next_checkpoint += checkpoint_interval;
+            let bu = reference::bu_fixed(rendered, tempo_mbpm);
+            let mut positions = Vec::with_capacity(tracks.len());
+            let mut refs = Vec::with_capacity(tracks.len());
+            for (slot, t) in tracks.iter().enumerate() {
+                let engine_pos = core
+                    .dictated_unwrapped_position(slot)
+                    .expect("track installed");
+                let ref_pos = reference::u(&bu, t.o_mbpm);
+                if engine_pos != ref_pos {
+                    position_mismatches += 1;
+                }
+                positions.push(engine_pos);
+                refs.push(ref_pos);
+            }
+            checkpoints.push(Checkpoint { rendered_frames: rendered, positions, reference: refs });
+        }
+    }
+
+    let mix_rms = (sumsq / (rendered as f64 * 2.0)).sqrt();
+    drop(plane);
+    ScenarioResult { checkpoints, position_mismatches, mix_rms }
+}
