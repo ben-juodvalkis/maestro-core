@@ -1,0 +1,24 @@
+[workspace]
+resolver = "2"
+members = ["maestro-core", "maestro-api"]
+
+# Workspace-wide profiles (member-level profile sections are ignored by Cargo).
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+
+# WASM-specific release profile — strips debug symbols and panic unwinding
+# infrastructure. Native builds should NOT use this to preserve Sentry stack traces.
+[profile.release-wasm]
+inherits = "release"
+strip = true
+panic = "abort"
+
+# Integration tests render tens of millions of frames (T-INV, spec §6.2);
+# unoptimized u128 division makes that unbearably slow. Debug assertions stay on.
+[profile.test]
+opt-level = 2
+
+[profile.dev.package."*"]
+opt-level = 2

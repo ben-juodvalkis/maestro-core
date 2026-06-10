@@ -15,6 +15,9 @@ crate-type = ["lib", "cdylib", "staticlib"]
 # Uses colinmarc's crate: bindgen + cc compiles the C++ header-only library
 signalsmith-stretch = { version = "0.1", optional = true }
 
+# Lock-free SPSC queues for the RT command/event/reclaim paths (spec §3.3).
+rtrb = "0.3"
+
 # Step 9: WASM exports via wasm-bindgen
 # Feature-gated: only compiled for wasm32 targets
 wasm-bindgen = { version = "0.2", optional = true }
@@ -24,22 +27,19 @@ serde_json = { version = "1", optional = true }
 
 
 [dev-dependencies]
-# No external test deps needed yet — std assertions suffice
+# Exact rational reference implementation for T-INV (spec §6.2) — test-only,
+# never linked into the shipped engine.
+num-bigint = "0.4"
+# Proves the render loop performs zero heap allocation (spec §3.3 RT rules).
+assert_no_alloc = "1"
 
 [features]
 default = ["native-stretch"]
 native-stretch = ["signalsmith-stretch"]  # Step 8: native C++ time-stretching
 json = ["serde", "serde_json"]            # JSON serialization for complex types
 wasm = ["wasm-bindgen", "js-sys", "json"] # Step 9: wasm-bindgen exports (includes json)
-
-[profile.release]
-opt-level = 3
-lto = true
-codegen-units = 1
-
-# WASM-specific release profile — strips debug symbols and panic unwinding
-# infrastructure. Native builds should NOT use this to preserve Sentry stack traces.
-[profile.release-wasm]
-inherits = "release"
-strip = true
-panic = "abort"
+# Sabotage modes for T-INV negative controls (spec §6.2): float_cursor,
+# pcm_length_loop, timer_clock. CI builds with this feature and asserts the
+# invariant suite DETECTS each mode (the suite is broken if a sabotage passes).
+# Never enabled in shipping builds.
+drift-injection = []
