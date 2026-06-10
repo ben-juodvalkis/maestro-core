@@ -238,6 +238,15 @@ impl ControlPlane {
 
         // Per-track stretcher (spec §4.3), preconfigured and preallocated here
         // so the audio thread never allocates.
+        //
+        // preset_default is REQUIRED. The spec's budget fallback (§4.3,
+        // new_cheaper globally) was tried on-device 2026-06-10 and REJECTED:
+        // at rate 2.0 it attenuates click transients ~3× (109 of 146 onsets
+        // fell below the detection threshold) and shifts detected attacks a
+        // constant ~5,515 samples (~115 ms) — audibly out of sync (caught by
+        // ear before the analyzer ran; capture evidence in
+        // documentation/validation-runs/). The C0 budget gate is instead met
+        // via Plan B (spec §3.3) — see render pump.
         let stretcher = Box::new(Stretcher::new(2, ENGINE_SAMPLE_RATE));
         let state = Box::new(crate::audio_core::TrackState::new(
             map,
