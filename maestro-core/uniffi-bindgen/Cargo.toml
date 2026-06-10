@@ -1,0 +1,19 @@
+# Standalone (workspace-excluded) so the heavy uniffi CLI deps never enter the
+# workspace lockfile or the `cargo test --workspace` build graph. Invoked by
+# maestro-core/scripts/build-ios.sh in library mode against the compiled dylib.
+[package]
+name = "uniffi-bindgen"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "UniFFI binding generator for maestro-core — generates Swift from the compiled .dylib"
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "main.rs"
+
+[dependencies]
+uniffi = { version = "0.31", features = ["cli"] }
+
+# Explicitly standalone (belt to the root manifest's exclude suspenders).
+[workspace]

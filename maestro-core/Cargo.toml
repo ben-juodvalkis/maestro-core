@@ -15,6 +15,9 @@ crate-type = ["lib", "cdylib", "staticlib"]
 # Uses colinmarc's crate: bindgen + cc compiles the C++ header-only library
 signalsmith-stretch = { version = "0.1", optional = true }
 
+# UniFFI — the native six-function transport (spec §3.6). Native targets only.
+uniffi = { version = "0.31", optional = true }
+
 # Lock-free SPSC queues for the RT command/event/reclaim paths (spec §3.3).
 rtrb = "0.3"
 
@@ -41,6 +44,7 @@ default = ["native-stretch"]
 native-stretch = ["signalsmith-stretch"]  # Step 8: native C++ time-stretching
 json = ["serde", "serde_json"]            # JSON serialization for complex types
 wasm = ["wasm-bindgen", "js-sys", "json"] # Step 9: wasm-bindgen exports (includes json)
+uniffi-bindings = ["uniffi", "json", "native-stretch"] # native transport (spec §3.6)
 # Sabotage modes for T-INV negative controls (spec §6.2): float_cursor,
 # pcm_length_loop, timer_clock. CI builds with this feature and asserts the
 # invariant suite DETECTS each mode (the suite is broken if a sabotage passes).

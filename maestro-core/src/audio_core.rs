@@ -571,7 +571,8 @@ fn render_track(
     left: &mut [f32],
     right: &mut [f32],
 ) {
-    let unity = ts.map.original_tempo_mbpm() == tempo_mbpm;
+    #[allow(unused_mut)]
+    let mut unity = ts.map.original_tempo_mbpm() == tempo_mbpm;
 
     // Dictated span for this block (first difference — telescopes exactly).
     #[allow(unused_mut)]
@@ -580,6 +581,18 @@ fn render_track(
         let n1 = ts.dictated_u(bu1);
         (n0, (n1 - n0) as usize)
     };
+
+    #[cfg(feature = "drift-injection")]
+    if crate::sabotage::mode() == crate::sabotage::Sabotage::StretchDisabled {
+        // Defect class D5: stretch silently disabled — the track plays 1:1
+        // from the timeline epoch regardless of tempo (source sample = output
+        // frame). Reported positions stay correct (the defect was *silent*);
+        // the device analyzer must catch it from the AUDIO (C0 negative
+        // control: cross-tempo onsets land at wrong spacing).
+        unity = true;
+        n0 = (bu0 / tempo_mbpm as u128) as u64;
+        span = ((bu1 - bu0) / tempo_mbpm as u128) as usize;
+    }
 
     #[cfg(feature = "drift-injection")]
     if crate::sabotage::mode() == crate::sabotage::Sabotage::FloatCursor {
@@ -616,6 +629,13 @@ fn render_track(
             ts.anchor(n0, rate);
             ts.needs_anchor = false;
         }
+        // The seek window already primed input up to u + input_latency;
+        // streaming continues from there. Re-feeding from u would double-feed
+        // the overlap and delay every output by input_latency/rate — a
+        // rate-DEPENDENT lag that misaligns cross-tempo stems (measured:
+        // 720 samples between rates 2.0 and 1.33). The shift is a constant
+        // inside the position→content mapping; positions remain derived.
+        let n0 = n0 + ts.stretcher.input_latency() as u64;
         if span == 0 {
             // Sub-frame source advance (only possible at extreme rate × tiny
             // block combinations outside M0's envelope). Hold silence for the

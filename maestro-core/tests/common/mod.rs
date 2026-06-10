@@ -11,8 +11,6 @@
 pub mod reference;
 pub mod validation_thresholds;
 
-use std::fs::File;
-use std::io::Read;
 use std::path::PathBuf;
 
 use maestro_api::{Command, EngineConfig, LoadMeta};
@@ -22,16 +20,12 @@ use maestro_core::control_plane::{create_engine, ControlPlane};
 pub const SAMPLE_RATE: u32 = 48_000;
 
 // ---------------------------------------------------------------------------
-// WAV fixtures
+// WAV fixtures + onset detection: shared with maestro-validate via
+// maestro_core::validation (spec §7 — promoted from the branch's test code).
 // ---------------------------------------------------------------------------
 
-pub struct LoadedWav {
-    /// Per-channel PCM data, length = `frames`.
-    pub channels: Vec<Vec<f32>>,
-    pub sample_rate: u32,
-    pub num_channels: u32,
-    pub frames: usize,
-}
+#[allow(unused_imports)] // each integration-test binary uses a subset
+pub use maestro_core::validation::{detect_click_onsets, load_float_wav, LoadedWav};
 
 pub fn fixture_path(name: &str) -> PathBuf {
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -39,83 +33,6 @@ pub fn fixture_path(name: &str) -> PathBuf {
     p.push("fixtures");
     p.push(name);
     p
-}
-
-/// Minimal RIFF/WAVE reader supporting 32-bit IEEE float PCM (format tag 3).
-/// Walks chunks so it handles `JUNK` blocks Logic Pro inserts before `fmt `.
-pub fn load_float_wav(path: &PathBuf) -> std::io::Result<LoadedWav> {
-    let mut f = File::open(path)?;
-    let mut buf = Vec::new();
-    f.read_to_end(&mut buf)?;
-
-    assert_eq!(&buf[0..4], b"RIFF", "{path:?}: not a RIFF file");
-    assert_eq!(&buf[8..12], b"WAVE", "{path:?}: not a WAVE file");
-
-    let mut pos: usize = 12;
-    let mut fmt_tag: u16 = 0;
-    let mut num_channels: u32 = 0;
-    let mut sample_rate: u32 = 0;
-    let mut bits_per_sample: u16 = 0;
-    let mut data_offset: usize = 0;
-    let mut data_size: usize = 0;
-
-    while pos + 8 <= buf.len() {
-        let cid = &buf[pos..pos + 4];
-        let csize = u32::from_le_bytes(buf[pos + 4..pos + 8].try_into().unwrap()) as usize;
-        let body = pos + 8;
-        match cid {
-            b"fmt " => {
-                fmt_tag = u16::from_le_bytes(buf[body..body + 2].try_into().unwrap());
-                num_channels = u16::from_le_bytes(buf[body + 2..body + 4].try_into().unwrap()) as u32;
-                sample_rate = u32::from_le_bytes(buf[body + 4..body + 8].try_into().unwrap());
-                bits_per_sample = u16::from_le_bytes(buf[body + 14..body + 16].try_into().unwrap());
-            }
-            b"data" => {
-                data_offset = body;
-                data_size = csize;
-                break;
-            }
-            _ => {}
-        }
-        pos = body + csize + (csize & 1);
-    }
-
-    assert_eq!(fmt_tag, 3, "{path:?}: expected IEEE float (tag 3), got {fmt_tag}");
-    assert_eq!(bits_per_sample, 32, "{path:?}: expected 32-bit float");
-    assert!(data_offset > 0 && data_size > 0, "{path:?}: missing data chunk");
-
-    let bytes_per_sample = (bits_per_sample / 8) as usize;
-    let frames = data_size / (num_channels as usize * bytes_per_sample);
-    let mut channels: Vec<Vec<f32>> =
-        (0..num_channels).map(|_| Vec::with_capacity(frames)).collect();
-
-    for frame in 0..frames {
-        for (ch, channel) in channels.iter_mut().enumerate() {
-            let off = data_offset + (frame * num_channels as usize + ch) * bytes_per_sample;
-            channel.push(f32::from_le_bytes(buf[off..off + 4].try_into().unwrap()));
-        }
-    }
-
-    Ok(LoadedWav { channels, sample_rate, num_channels, frames })
-}
-
-// ---------------------------------------------------------------------------
-// Click-onset detection (spec §7: promoted from the branch's
-// render_pipeline_integration.rs; reused by T-SEAM and maestro-validate)
-// ---------------------------------------------------------------------------
-
-/// Detect click onset frames in one channel. An onset is the first frame above
-/// `threshold` after a quiet gap of at least `min_gap_frames`.
-pub fn detect_click_onsets(channel: &[f32], threshold: f32, min_gap_frames: usize) -> Vec<usize> {
-    let mut onsets = Vec::new();
-    let mut last_onset: i64 = -(min_gap_frames as i64);
-    for (frame, s) in channel.iter().enumerate() {
-        if s.abs() > threshold && (frame as i64) - last_onset >= min_gap_frames as i64 {
-            onsets.push(frame);
-            last_onset = frame as i64;
-        }
-    }
-    onsets
 }
 
 // ---------------------------------------------------------------------------

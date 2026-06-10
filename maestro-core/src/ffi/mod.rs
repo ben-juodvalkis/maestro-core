@@ -5,8 +5,11 @@
 //! - **WASM** (`wasm` feature): `wasm-bindgen` exports for web consumption.
 //!   See [`wasm_bindings`] for the JavaScript API.
 //!
-//! - **UniFFI** (future): Swift/Kotlin bindings for Capacitor plugin.
-//!   Will be added in a later step.
+//! - **UniFFI** (`uniffi-bindings` feature): the six-function native
+//!   transport (spec §3.6). See [`uniffi_api`].
 
 #[cfg(feature = "wasm")]
 pub mod wasm_bindings;
+
+#[cfg(feature = "uniffi-bindings")]
+pub mod uniffi_api;

@@ -24,6 +24,10 @@ pub enum Sabotage {
     FloatCursor = 1,
     PcmLengthLoop = 2,
     TimerClock = 3,
+    /// Defect D5/D6 class: stretch silently disabled — non-unity tracks read
+    /// 1:1 (wrong rate). The C0 device checkpoint's cross-tempo scenario must
+    /// FAIL its analysis against a build running this mode (spec §6.1).
+    StretchDisabled = 4,
 }
 
 static MODE: AtomicU8 = AtomicU8::new(0);
@@ -38,6 +42,14 @@ pub fn mode() -> Sabotage {
         1 => Sabotage::FloatCursor,
         2 => Sabotage::PcmLengthLoop,
         3 => Sabotage::TimerClock,
+        4 => Sabotage::StretchDisabled,
         _ => Sabotage::None,
     }
+}
+
+/// Select a sabotage mode by name from the device harness (sabotaged
+/// validation builds only — this symbol does not exist in shipping builds).
+#[no_mangle]
+pub extern "C" fn maestro_set_sabotage(mode: u8) {
+    MODE.store(if mode <= 4 { mode } else { 0 }, Ordering::SeqCst);
 }

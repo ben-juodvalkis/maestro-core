@@ -35,6 +35,10 @@ pub mod control_plane;
 #[cfg(feature = "drift-injection")]
 pub mod sabotage;
 
+// Shared analysis utilities (WAV loading, onset detection) for the offline
+// suites and the maestro-validate device-capture analyzer (spec §6.4).
+pub mod validation;
+
 // Step 1: Pure math — timing conversions and beat timeline
 pub mod timing;
 pub mod beat_timeline;
@@ -67,5 +71,10 @@ pub mod engine;
 // Feature-gated: `native-stretch` for native targets, stub for WASM
 pub mod stretch;
 
-// Step 9: Foreign Function Interface — wasm-bindgen exports (web) and UniFFI (native, future)
+// Step 9: Foreign Function Interface — wasm-bindgen exports (web) and the
+// UniFFI six-function transport (native, spec §3.6)
 pub mod ffi;
+
+// UniFFI scaffolding must be defined at the crate root.
+#[cfg(feature = "uniffi-bindings")]
+uniffi::setup_scaffolding!();

@@ -1,6 +1,9 @@
 [workspace]
 resolver = "2"
-members = ["maestro-core", "maestro-api"]
+members = ["maestro-core", "maestro-api", "maestro-validate"]
+# Standalone helper with its own lockfile: keeps the uniffi CLI dependency
+# tree (clap et al.) out of the workspace graph. Built by build-ios.sh.
+exclude = ["maestro-core/uniffi-bindgen"]
 
 # Workspace-wide profiles (member-level profile sections are ignored by Cargo).
 [profile.release]
