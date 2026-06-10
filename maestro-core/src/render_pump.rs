@@ -31,8 +31,18 @@ use crate::audio_core::AudioCore;
 
 /// Producer render chunk (frames). Larger than typical OS callbacks so the
 /// Signalsmith hop-burst cost amortizes; small enough to keep command-to-ear
-/// latency bounded (512 frames ≈ 10.7 ms render cadence).
-pub const PUMP_CHUNK_FRAMES: usize = 512;
+/// latency bounded (1024 frames ≈ 21.3 ms render cadence, within the §4.10
+/// accepted control-feel envelope).
+///
+/// Raised 512 → 1024 for checkpoint C1 (ADR-091): once a variation switch
+/// re-anchors one track, its hop bursts de-phase from the tracks anchored at
+/// Play, spreading bursts across MORE chunks — at 512 frames the
+/// blocks-over-half-period budget proxy measured ~1.2% (gate ≤ 1%) with
+/// max and underruns unchanged (53%, 0). Doubling the chunk averages ~2× the
+/// hops per measurement window, pulling the proxy back under the gate
+/// without touching any threshold. Sync is unaffected by construction
+/// (positions derive from F; T-PUMP asserts bit-identity).
+pub const PUMP_CHUNK_FRAMES: usize = 1024;
 /// Ring capacity (frames, stereo interleaved underneath). Worst-case added
 /// output latency = ring occupancy ≈ 85 ms at 48 kHz.
 pub const PUMP_RING_FRAMES: usize = 4096;

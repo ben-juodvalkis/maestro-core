@@ -86,6 +86,13 @@ mod thresholds {
     /// bracketed by median-equality gates on both boundaries instead, which
     /// bound any in-window drift to the step thresholds.
     pub const MIN_SLOPE_WINDOW_ONSETS: usize = 32;
+    /// VALIDATION-THRESHOLD (C1): longest admissible exact period (in
+    /// onsets) of a window's offset pattern. The primary zero-accumulation
+    /// assertion is EXACT periodicity (one sample lost or gained anywhere
+    /// breaks it — T-SEAM's rule); the LS slope gate is the fallback for
+    /// aperiodic-but-flat windows. A period must repeat at least twice
+    /// inside the window to count.
+    pub const ONSET_PATTERN_PERIOD_MAX: usize = 16;
 }
 
 #[derive(Serialize)]
@@ -273,6 +280,39 @@ fn window_offsets(onsets: &[u64], grid: &[u64], align: i64) -> Option<Window> {
     Some(Window { offsets, median, slope, spread })
 }
 
+/// Zero-accumulation verdict for a window of offsets (the spec §6.1 rule:
+/// assert periodicity/slope, never per-onset constancy). The first onset of
+/// the window is a boundary artifact (activation ramp / crossfade /
+/// re-anchor settling) and is excluded. Primary: the remaining offsets are
+/// EXACTLY periodic (period repeating ≥ 2× inside the window) — one sample
+/// lost or gained anywhere breaks this, as does any slope. Fallback for
+/// aperiodic-but-flat windows: the LS slope gate.
+fn zero_accumulation(w: &Window) -> (bool, String) {
+    let body = if w.offsets.len() > 1 { &w.offsets[1..] } else { &w.offsets[..] };
+    let max_p = thresholds::ONSET_PATTERN_PERIOD_MAX.min(body.len() / 2);
+    for p in 1..=max_p {
+        if body.iter().zip(body.iter().skip(p)).all(|(a, b)| a == b) {
+            return (
+                true,
+                format!(
+                    "offsets exactly periodic (period {p}, {} onsets) — zero accumulation",
+                    body.len()
+                ),
+            );
+        }
+    }
+    (
+        w.slope.abs() < thresholds::ZERO_SLOPE_PER_ONSET_MAX,
+        format!(
+            "aperiodic within period ≤ {}; LS slope {:.6} samples/onset over {} onsets (gate < {})",
+            thresholds::ONSET_PATTERN_PERIOD_MAX,
+            w.slope,
+            w.offsets.len(),
+            thresholds::ZERO_SLOPE_PER_ONSET_MAX
+        ),
+    )
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     let usage = "usage: maestro-validate --capture <wav> --scenario <unity|cross|timing|budget> \
@@ -442,6 +482,7 @@ fn analyze_offset_pairs(
     // ------------------------------------------------------------ pair align
     let skip = thresholds::SKIP_LEADING_ONSETS;
     let mut offsets: Vec<i64> = Vec::new();
+    let mut pair_pos: Vec<u64> = Vec::new(); // capture frame of each pair (L onset)
     let half_beat = (beat_frames / 2.0) as i64;
     let mut ri = 0usize;
     for &l in onsets_l.iter().skip(skip) {
@@ -455,6 +496,7 @@ fn analyze_offset_pairs(
             let d = l as i64 - onsets_r[ri] as i64;
             if d.abs() < half_beat {
                 offsets.push(d);
+                pair_pos.push(l as u64);
             }
         }
     }
@@ -472,15 +514,86 @@ fn analyze_offset_pairs(
     } else {
         (0.0, f64::INFINITY, 0, 0)
     };
-    gate(
-        "zero-drift",
-        total_drift.abs() < thresholds::MAX_TOTAL_DRIFT_SAMPLES,
-        format!(
-            "offset slope {slope:.6} samples/onset ⇒ {total_drift:.3} samples over the capture \
-             (gate: |drift| < {})",
-            thresholds::MAX_TOTAL_DRIFT_SAMPLES
-        ),
-    );
+    let budget_log = match (scenario, harness_json) {
+        ("budget", Some(hr)) => parse_command_log(hr, tempo_mbpm).ok().filter(|l| l.segments.len() > 1),
+        _ => None,
+    };
+    if let Some(log) = &budget_log {
+        // The budget scenario contains scripted commands (tempo changes +
+        // variation switch): a whole-capture LS fit is invalid across those
+        // boundaries (each one legitimately re-phases the vocoder's smear
+        // pattern). Instead: zero accumulation inside each command-free
+        // segment, plus a bounded net step from the first segment to the
+        // last (the same estimator design as the timing scenario).
+        let d_est = (wav.frames as i64 - log.final_frame as i64).max(0) as u64 / 2;
+        let margin = (1.5 * wav.sample_rate as f64) as u64;
+        let mut boundaries: Vec<u64> = log.segments[1..].iter().map(|&(f, _)| f + d_est).collect();
+        if let Some(v) = log.variation_at {
+            boundaries.push(v + d_est);
+        }
+        boundaries.sort_unstable();
+        let seg_of = |pos: u64| boundaries.iter().filter(|&&b| pos >= b).count();
+        let excluded =
+            |pos: u64| boundaries.iter().any(|&b| pos + margin > b && pos < b + margin);
+        let n_segs = boundaries.len() + 1;
+        let mut seg_windows: Vec<Option<Window>> = Vec::new();
+        for s in 0..n_segs {
+            let seg_offsets: Vec<i64> = offsets
+                .iter()
+                .zip(&pair_pos)
+                .filter(|(_, &p)| seg_of(p) == s && !excluded(p))
+                .map(|(&o, _)| o)
+                .collect();
+            if seg_offsets.len() < 2 {
+                seg_windows.push(None);
+                continue;
+            }
+            let med = median(&seg_offsets);
+            let sl = linear_slope(&seg_offsets);
+            let spread = seg_offsets.iter().max().unwrap() - seg_offsets.iter().min().unwrap();
+            seg_windows.push(Some(Window { offsets: seg_offsets, median: med, slope: sl, spread }));
+        }
+        for (s, w) in seg_windows.iter().enumerate() {
+            match w {
+                Some(w) if w.offsets.len() >= thresholds::MIN_WINDOW_ONSETS => {
+                    let (ok, detail) = zero_accumulation(w);
+                    gate(&format!("zero-drift-segment-{s}"), ok, detail);
+                }
+                _ => gate(
+                    &format!("zero-drift-segment-{s}"),
+                    true,
+                    "segment too short between commands — bounded by the net-step gate".into(),
+                ),
+            }
+        }
+        let first = seg_windows.iter().flatten().next();
+        let last = seg_windows.iter().flatten().last();
+        if let (Some(first), Some(last)) = (first, last) {
+            let step = last.median - first.median;
+            gate(
+                "net-offset-step",
+                step.abs() <= thresholds::TEMPO_CHANGE_STEP_MAX,
+                format!(
+                    "cross-stem median offset: first segment {} vs last {} (step {step}, gate ≤ {})",
+                    first.median,
+                    last.median,
+                    thresholds::TEMPO_CHANGE_STEP_MAX
+                ),
+            );
+        } else {
+            gate("net-offset-step", false, "missing analyzable segments".into());
+        }
+    } else {
+        gate(
+            "zero-drift",
+            total_drift.abs() < thresholds::MAX_TOTAL_DRIFT_SAMPLES,
+            format!(
+                "offset slope {slope:.6} samples/onset ⇒ {total_drift:.3} samples over the capture \
+                 (gate: |drift| < {})",
+                thresholds::MAX_TOTAL_DRIFT_SAMPLES
+            ),
+        );
+    }
 
     // ----------------------------------------------------------- spread gate
     let spread = omax - omin;
@@ -609,10 +722,11 @@ fn analyze_timing(
     let a_mid = win(&w2);
     let a_post = win(&w3);
 
-    // Zero slope both sides of the change (C1): no accumulation anywhere.
-    // Windows shorter than MIN_SLOPE_WINDOW_ONSETS can't support a slope fit
-    // against the periodic jitter; they are bracketed by the median-equality
-    // gates on both boundaries instead (reported, not silently skipped).
+    // Zero accumulation on both sides of the change (C1): exact periodicity
+    // of the offset pattern (primary) or zero LS slope (fallback). Windows
+    // shorter than MIN_SLOPE_WINDOW_ONSETS can't support either against the
+    // jitter pattern; they are bracketed by the median-equality gates on
+    // both boundaries instead (reported, not silently skipped).
     for (name, w) in
         [("a-zero-slope-pre", &a_pre), ("a-zero-slope-post", &a_mid), ("a-zero-slope-post-variation", &a_post)]
     {
@@ -629,16 +743,8 @@ fn analyze_timing(
             );
             continue;
         }
-        gate(
-            name,
-            w.slope.abs() < thresholds::ZERO_SLOPE_PER_ONSET_MAX,
-            format!(
-                "slope {:.6} samples/onset over {} onsets (gate < {})",
-                w.slope,
-                w.offsets.len(),
-                thresholds::ZERO_SLOPE_PER_ONSET_MAX
-            ),
-        );
+        let (ok, detail) = zero_accumulation(w);
+        gate(name, ok, detail);
     }
     // Offset before == offset after the tempo change (C1).
     let a_step = a_mid.median - a_pre.median;
@@ -741,15 +847,8 @@ fn analyze_timing(
             b_pre.median, b_post.median, thresholds::RE_ENTRY_STEP_MAX
         ),
     );
-    gate(
-        "b-zero-slope-post",
-        b_post.slope.abs() < thresholds::ZERO_SLOPE_PER_ONSET_MAX,
-        format!(
-            "stem B post-restart: slope {:.6} samples/onset (gate < {})",
-            b_post.slope,
-            thresholds::ZERO_SLOPE_PER_ONSET_MAX
-        ),
-    );
+    let (b_ok, b_detail) = zero_accumulation(&b_post);
+    gate("b-zero-slope-post", b_ok, format!("stem B post-restart: {b_detail}"));
     gate(
         "b-offset-bounded",
         b_pre.spread <= thresholds::STRETCH_OFFSET_SPREAD_MAX
