@@ -31,6 +31,10 @@ pub mod audio_core;
 #[cfg(feature = "native-stretch")]
 pub mod control_plane;
 
+// Plan B delivery (spec §3.3): dedicated producer thread + SPSC sample ring.
+#[cfg(feature = "native-stretch")]
+pub mod render_pump;
+
 // T-INV negative-control sabotage modes (spec §6.2). Test builds only.
 #[cfg(feature = "drift-injection")]
 pub mod sabotage;

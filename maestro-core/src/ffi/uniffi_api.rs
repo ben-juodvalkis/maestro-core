@@ -32,7 +32,18 @@ use std::sync::Mutex;
 
 use crate::audio_core::AudioCore;
 use crate::control_plane::{create_engine, ControlPlane};
+use crate::render_pump::RenderPump;
 // Note: `uniffi::setup_scaffolding!()` lives in lib.rs (crate root requirement).
+
+/// How the engine is being driven (spec §3.3): direct render in the OS
+/// callback, or Plan B (producer thread + ring) once `start_pump` is called.
+enum Runtime {
+    Direct(Box<AudioCore>),
+    Pumped(RenderPump),
+    /// Momentary state inside `start_pump` while the core moves between
+    /// owners; never observable through the public surface.
+    Transitioning,
+}
 
 #[derive(Debug, uniffi::Error)]
 #[uniffi(flat_error)]
@@ -54,10 +65,10 @@ impl std::error::Error for MaestroFfiError {}
 pub struct MaestroEngine {
     #[allow(clippy::disallowed_types)]
     control: Mutex<ControlPlane>,
-    /// Owns the audio core so its address stays stable for the lifetime of
-    /// the engine object; the render callback reaches it via `core_pointer`.
+    /// Owns the engine driver; addresses handed to the render callback stay
+    /// stable for the lifetime of the engine object.
     #[allow(clippy::disallowed_types)]
-    core: Mutex<Box<AudioCore>>,
+    runtime: Mutex<Runtime>,
 }
 
 fn json_result(result: maestro_api::CommandResult) -> String {
@@ -77,7 +88,10 @@ impl MaestroEngine {
             .map_err(|e| MaestroFfiError::InvalidConfig(e.to_string()))?;
         let (control, core) =
             create_engine(config).map_err(|e| MaestroFfiError::InvalidConfig(e.to_string()))?;
-        Ok(Arc::new(Self { control: Mutex::new(control), core: Mutex::new(core) }))
+        Ok(Arc::new(Self {
+            control: Mutex::new(control),
+            runtime: Mutex::new(Runtime::Direct(core)),
+        }))
     }
 
     /// `dispatch`: a `maestro-api` `Command` in, a `CommandResult` out.
@@ -119,11 +133,37 @@ impl MaestroEngine {
         }
     }
 
-    /// The `AudioCore` pointer for the render callback. Pass to
-    /// `maestro_render` (C ABI) from the audio thread only. See the module
-    /// docs for the lifetime contract.
+    /// The `AudioCore` pointer for direct rendering (`maestro_render`).
+    /// Returns 0 once the pump has started — the two modes are exclusive.
     pub fn core_pointer(&self) -> u64 {
-        let mut core = self.core.lock().expect("core storage lock poisoned");
-        core.as_mut() as *mut AudioCore as u64
+        let mut runtime = self.runtime.lock().expect("runtime lock poisoned");
+        match &mut *runtime {
+            Runtime::Direct(core) => core.as_mut() as *mut AudioCore as u64,
+            _ => 0,
+        }
+    }
+
+    /// Switch to Plan B delivery (spec §3.3): move the audio core onto a
+    /// dedicated producer thread feeding an SPSC ring. Idempotent. After this,
+    /// the render callback must use `maestro_pump_consume(pumpPointer(), …)`.
+    pub fn start_pump(&self) {
+        let mut runtime = self.runtime.lock().expect("runtime lock poisoned");
+        let prev = std::mem::replace(&mut *runtime, Runtime::Transitioning);
+        *runtime = match prev {
+            Runtime::Direct(core) => Runtime::Pumped(RenderPump::start(core)),
+            other => other,
+        };
+    }
+
+    /// The `PumpConsumer` pointer for the Plan B render callback
+    /// (`maestro_pump_consume`). Returns 0 unless the pump is running. Same
+    /// lifetime contract as `core_pointer`: stop the AVAudioEngine before
+    /// releasing the engine reference.
+    pub fn pump_pointer(&self) -> u64 {
+        let mut runtime = self.runtime.lock().expect("runtime lock poisoned");
+        match &mut *runtime {
+            Runtime::Pumped(pump) => pump.consumer_ptr() as u64,
+            _ => 0,
+        }
     }
 }

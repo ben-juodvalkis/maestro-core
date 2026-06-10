@@ -301,6 +301,10 @@ pub struct AudioCore {
     render_ns_max: u64,
     blocks_total: u64,
     blocks_over_half_period: u64,
+    /// Plan B (render pump): ring-starvation underruns counted by the audio
+    /// callback, merged into the snapshot's `underruns` (the C0 gate). Reading
+    /// an atomic in `write_snapshot` is RT-safe.
+    external_underruns: Option<std::sync::Arc<std::sync::atomic::AtomicU32>>,
     /// Deterministic LCG driving the timer_clock sabotage jitter.
     #[cfg(feature = "drift-injection")]
     lcg: u64,
@@ -329,6 +333,7 @@ impl AudioCore {
             render_ns_max: 0,
             blocks_total: 0,
             blocks_over_half_period: 0,
+            external_underruns: None,
             #[cfg(feature = "drift-injection")]
             lcg: 0x9E37_79B9_7F4A_7C15,
         }
@@ -337,6 +342,13 @@ impl AudioCore {
     /// Master clock value `F` — frames actually rendered while playing.
     pub fn frame(&self) -> u64 {
         self.frame
+    }
+
+    /// Wire the ring-starvation counter (Plan B render pump) into the
+    /// snapshot's `underruns`. Called once before the core moves to the
+    /// producer thread.
+    pub fn set_external_underruns(&mut self, counter: std::sync::Arc<std::sync::atomic::AtomicU32>) {
+        self.external_underruns = Some(counter);
     }
 
     /// The dictated unwrapped source position of a track **as the renderer
@@ -525,7 +537,12 @@ impl AudioCore {
             timeline_epoch: self.timeline.epoch(),
             bar: (whole_beats / self.beats_per_bar as u64) as u32 + 1,
             beat_in_bar: (whole_beats % self.beats_per_bar as u64) as f32 + frac + 1.0,
-            underruns: self.underruns,
+            underruns: self.underruns
+                + self
+                    .external_underruns
+                    .as_ref()
+                    .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+                    .unwrap_or(0),
             render_ns_max: self.render_ns_max,
             callback_period_ns: period_ns,
             blocks_total: self.blocks_total,
