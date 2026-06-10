@@ -47,6 +47,9 @@ echo "=== Building maestro-core for iOS ($PROFILE, features: $FEATURES) ==="
 cd "$REPO_DIR"
 
 echo "--- Step 1: iOS targets ---"
+# Match the app's deployment target so the static lib links without
+# min-version warnings (the SDK default would stamp the current iOS version).
+export IPHONEOS_DEPLOYMENT_TARGET=14.0
 cargo build $CARGO_FLAGS -p maestro-core --target aarch64-apple-ios --features "$FEATURES"
 
 # signalsmith-stretch's bindgen needs help with the -sim triple.
