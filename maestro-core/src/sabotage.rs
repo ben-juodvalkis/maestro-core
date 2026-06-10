@@ -47,9 +47,6 @@ pub fn mode() -> Sabotage {
     }
 }
 
-/// Select a sabotage mode by name from the device harness (sabotaged
-/// validation builds only — this symbol does not exist in shipping builds).
-#[no_mangle]
-pub extern "C" fn maestro_set_sabotage(mode: u8) {
+pub(crate) fn set_mode_raw(mode: u8) {
     MODE.store(if mode <= 4 { mode } else { 0 }, Ordering::SeqCst);
 }

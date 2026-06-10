@@ -18,6 +18,11 @@ extern "C" {
 
 void maestro_render(void *core, float *left, float *right, uint32_t frames);
 
+// Drift-injection sabotage selector for §6.4 negative-control runs.
+// Always linkable; a no-op unless the library was built with the
+// `drift-injection` feature (sabotaged validation builds only).
+void maestro_set_sabotage(uint8_t mode);
+
 #ifdef __cplusplus
 }
 #endif

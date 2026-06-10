@@ -560,6 +560,18 @@ pub unsafe extern "C" fn maestro_render(
     core.render(l, r);
 }
 
+/// Select a drift-injection sabotage mode from the device harness
+/// (spec §6.4 negative controls). **No-op in shipping builds** — the symbol
+/// always exists (so the Swift harness links unconditionally), but only a
+/// `drift-injection` build has a sabotage selector to set.
+#[no_mangle]
+pub extern "C" fn maestro_set_sabotage(mode: u8) {
+    #[cfg(feature = "drift-injection")]
+    crate::sabotage::set_mode_raw(mode);
+    #[cfg(not(feature = "drift-injection"))]
+    let _ = mode;
+}
+
 /// Render one active track into the mix. Free function so the borrow on the
 /// track is independent of `self` (the event queue is handled by the caller).
 fn render_track(
