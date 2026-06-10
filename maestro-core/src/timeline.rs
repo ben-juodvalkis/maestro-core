@@ -519,7 +519,7 @@ mod tests {
                 assert_eq!(t.pcm_index(start), 0, "wrap {w} must start at PCM 0");
                 if start > 0 {
                     let last = t.pcm_index(start - 1);
-                    assert!(last <= t.pcm_len() - 1);
+                    assert!(last < t.pcm_len());
                     assert!(
                         last >= t.pcm_len() - 2,
                         "sample before wrap start should be near PCM end, got {last}"
