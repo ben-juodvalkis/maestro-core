@@ -30,7 +30,7 @@ fn t_inv_50m_frames_zero_drift_bit_exact() {
 
     // Anti-stub (spec §6.1): the mix must be audible, not silent.
     assert!(
-        result.mix_rms > 0.05,
+        result.mix_rms > common::validation_thresholds::MIN_MIX_RMS,
         "anti-stub: mix RMS {} below floor — green-over-silence is forbidden",
         result.mix_rms
     );

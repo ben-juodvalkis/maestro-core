@@ -9,6 +9,7 @@
 #![allow(dead_code)] // each integration-test binary uses a subset
 
 pub mod reference;
+pub mod validation_thresholds;
 
 use std::fs::File;
 use std::io::Read;
