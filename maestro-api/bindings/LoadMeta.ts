@@ -26,6 +26,15 @@ encoderDelay: number, endPadding: number,
  */
 originalSamples: bigint, 
 /**
+ * Variation index of this file. Loading a different variation into an
+ * occupied slot performs an engine-side variation switch (Arc PCM swap +
+ * re-anchor + one-block crossfade at a block boundary, spec §3.2); all
+ * variations of a stem must declare identical musical identity
+ * (`loop_beats` / `original_samples` / `original_tempo_mbpm`) or the
+ * load fails loudly (spec §3.4).
+ */
+variation: number, 
+/**
  * Initial gain/pan so M0 can hard-pan the metronome stems without a mixer surface.
  */
 gain: number, pan: number, };

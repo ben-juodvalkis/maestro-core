@@ -58,7 +58,7 @@ fn reactivation_render_never_allocates() {
         core.render(&mut left, &mut right);
     }
     assert!(matches!(plane.dispatch(Command::Deactivate { slot: 0 }), CommandResult::Ok));
-    assert!(matches!(plane.dispatch(Command::Activate { slot: 0 }), CommandResult::Ok));
+    assert!(matches!(plane.dispatch(Command::Activate { slot: 0, quantize: maestro_api::QuantizePolicy::Immediate }), CommandResult::Ok));
     assert_no_alloc(|| {
         for _ in 0..100 {
             core.render(&mut left, &mut right);

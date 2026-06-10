@@ -5,7 +5,11 @@ import type { TrackStatus } from "./TrackStatus";
  * Per-track slice of the snapshot. Track identity across the bridge is the
  * slot index; the backend owns the trackId ↔ slot map (spec §3.5).
  */
-export type TrackSnap = { slot: number, status: TrackStatus, loopCount: number, 
+export type TrackSnap = { slot: number, status: TrackStatus, 
+/**
+ * Currently rendering variation (spec §3.5).
+ */
+variation: number, loopCount: number, 
 /**
  * Derived from bu(F) mod Λ. Display only — floats never feed timing.
  */

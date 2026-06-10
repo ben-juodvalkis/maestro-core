@@ -35,10 +35,12 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use maestro_api::QuantizePolicy;
+
 use crate::pcm_cache::PcmData;
 use crate::seqlock::SeqLock;
 use crate::stretch::Stretcher;
-use crate::timeline::{beats_display, Timeline, TrackTimeline};
+use crate::timeline::{beats_display, Timeline, TrackTimeline, BEAT_UNITS_PER_BEAT};
 
 pub const MAX_TRACKS: usize = 16;
 /// Largest block size the engine preallocates for (spec §3.2). The OS chooses
@@ -57,13 +59,27 @@ pub enum RtCommand {
     Play,
     /// Transport stop: freezes `F`, resets the timeline epoch (spec §3.1).
     Stop,
-    /// Applied at the next block boundary. M0 gates this to stopped-transport
-    /// at the control plane; the core itself is M1-ready.
+    /// Freeze `F` without an epoch reset (spec §3.1) — all tracks at once;
+    /// positions are derived, so there is nothing per-track to freeze.
+    Pause,
+    /// Continue from `Pause`. Nothing is re-anchored.
+    Resume,
+    /// Applied at the next block boundary, live or stopped (M1). `bu` is
+    /// continuous across the change by construction; the application frame is
+    /// echoed via [`RtEvent::TempoApplied`].
     SetTempo { mbpm: u32 },
     InstallTrack { slot: u8, state: Box<TrackState> },
     RemoveTrack { slot: u8 },
-    Activate { slot: u8 },
+    Activate { slot: u8, quantize: QuantizePolicy },
     Deactivate { slot: u8 },
+    /// Per-track pitch in semitones (validated ±12 at the control plane,
+    /// spec §4.8). Audio-only: promotes a unity track to the stretch path
+    /// under the one-block crossfade; positions are unaffected.
+    SetPitch { slot: u8, semitones: f32 },
+    /// Variation switch (spec §3.2): Arc PCM swap + re-anchor + one-block
+    /// equal-power crossfade at the block boundary. The control plane has
+    /// already validated identical musical identity (spec §3.4).
+    SwapVariation { slot: u8, variation: u8, pcm: Arc<PcmData> },
 }
 
 /// Edge events audio core → control plane. `Copy` so dropping on overflow
@@ -72,6 +88,15 @@ pub enum RtCommand {
 pub enum RtEvent {
     Started,
     Stopped,
+    Paused { at_frame: u64 },
+    Resumed { at_frame: u64 },
+    /// Tempo echo (spec §3.1): `mbpm` took effect at exactly `at_frame`.
+    TempoApplied { mbpm: u32, at_frame: u64 },
+    /// A track became audible at exactly `at_frame` (immediate, or the
+    /// quantized activation frame `F_q`).
+    Activated { slot: u8, at_frame: u64 },
+    Deactivated { slot: u8, at_frame: u64 },
+    VariationApplied { slot: u8, variation: u8, at_frame: u64 },
     LoopWrapped { slot: u8, wrap_count: u32 },
     BudgetExceeded { render_ns: u64, period_ns: u64 },
 }
@@ -79,6 +104,8 @@ pub enum RtEvent {
 /// Resources the audio thread hands back for deallocation off-thread.
 pub enum Reclaimable {
     Track(Box<TrackState>),
+    /// A variation's outgoing PCM after its crossfade block (spec §3.2).
+    Pcm(Arc<PcmData>),
 }
 
 /// POD per-track snapshot slice (display only).
@@ -86,6 +113,7 @@ pub enum Reclaimable {
 pub struct RawTrackSnap {
     pub occupied: bool,
     pub active: bool,
+    pub variation: u8,
     pub loop_count: u32,
     pub loop_progress: f32,
     pub rms_l: f32,
@@ -100,6 +128,9 @@ pub struct RawSnapshot {
     pub frame: u64,
     pub tempo_mbpm: u32,
     pub playing: bool,
+    /// `F` frozen without epoch reset (spec §3.1). Only meaningful while
+    /// `playing` — pause does not stop the transport.
+    pub paused: bool,
     pub timeline_epoch: u32,
     /// Display-only beat position derived from bu(F).
     pub bar: u32,
@@ -119,6 +150,7 @@ impl RawSnapshot {
             frame: 0,
             tempo_mbpm,
             playing: false,
+            paused: false,
             timeline_epoch: 0,
             bar: 1,
             beat_in_bar: 0.0,
@@ -141,6 +173,27 @@ pub struct TrackState {
     active: bool,
     gain: f32,
     pan: f32,
+    /// Currently rendering variation (display/echo only).
+    variation: u8,
+    /// User pitch shift in semitones (±12, validated control-side). Nonzero
+    /// pitch forces the stretch path even at unity tempo (spec §3.2).
+    pitch_semitones: f32,
+    /// Last transpose actually set on the stretcher (effective, i.e. after
+    /// the combined-ratio clamp), so the render loop only re-sets on change.
+    applied_pitch: Option<f32>,
+    /// Quantized activation target (spec §3.1): the track becomes audible at
+    /// the first frame where `bu(F) ≥ pending_bu`; the render loop splits the
+    /// block there so activation is sample-exact within a block.
+    pending_bu: Option<u128>,
+    /// Path rendered last block (`Some(true)` = bypass): a flip triggers the
+    /// one-block equal-power crossfade (spec §3.2). `None` after (re)entry —
+    /// entries are masked by the activation ramp, not a crossfade.
+    prev_unity: Option<bool>,
+    /// Outgoing PCM during a variation switch: the fade-out source for the
+    /// crossfade block, then handed to the reclaim queue (never dropped here).
+    xfade_old_pcm: Option<Arc<PcmData>>,
+    /// A retired PCM waiting for reclaim-queue space (overflow fallback).
+    retired_pcm: Option<Arc<PcmData>>,
     /// Always provided (M1 tempo changes can move any track off unity).
     /// Preallocated by the control plane; `anchor` and `process` never allocate.
     stretcher: Box<Stretcher>,
@@ -151,6 +204,8 @@ pub struct TrackState {
     feed_scratch: Vec<f32>,
     /// Interleaved scratch, capacity `MAX_BLOCK_FRAMES * 2`.
     out_scratch: Vec<f32>,
+    /// Interleaved crossfade fade-out scratch, capacity `MAX_BLOCK_FRAMES * 2`.
+    xfade_scratch: Vec<f32>,
     /// Interleaved anchor window, capacity `(input_latency + output_latency) * 2`.
     anchor_scratch: Vec<f32>,
     /// Sabotage state for the banned accumulating-cursor class (spec §6.2
@@ -167,7 +222,14 @@ impl TrackState {
     /// Control-plane constructor: allocates every buffer the render path will
     /// ever touch for this track. `pcm` must be stereo with both channels of
     /// length `map.pcm_len()` (validated in the control plane).
-    pub fn new(map: TrackTimeline, pcm: Arc<PcmData>, gain: f32, pan: f32, mut stretcher: Box<Stretcher>) -> Self {
+    pub fn new(
+        map: TrackTimeline,
+        pcm: Arc<PcmData>,
+        gain: f32,
+        pan: f32,
+        variation: u8,
+        mut stretcher: Box<Stretcher>,
+    ) -> Self {
         let anchor_frames = stretcher.input_latency() + stretcher.output_latency();
         stretcher.preallocate(MAX_FEED_FRAMES.max(anchor_frames), MAX_BLOCK_FRAMES);
         Self {
@@ -176,12 +238,20 @@ impl TrackState {
             active: false,
             gain,
             pan,
+            variation,
+            pitch_semitones: 0.0,
+            applied_pitch: None,
+            pending_bu: None,
+            prev_unity: None,
+            xfade_old_pcm: None,
+            retired_pcm: None,
             stretcher,
             needs_anchor: true,
             ramp_remaining: 0,
             last_wrap_count: 0,
             feed_scratch: vec![0.0; MAX_FEED_FRAMES * 2],
             out_scratch: vec![0.0; MAX_BLOCK_FRAMES * 2],
+            xfade_scratch: vec![0.0; MAX_BLOCK_FRAMES * 2],
             anchor_scratch: vec![0.0; anchor_frames * 2],
             #[cfg(feature = "drift-injection")]
             float_cursor: None,
@@ -211,47 +281,8 @@ impl TrackState {
 
     /// Read `frames` source samples starting at unwrapped sample `n` into
     /// `dest` (interleaved stereo), following the beat-space Bresenham wrap.
-    /// Copies contiguous runs — cost is O(wraps in span), not O(samples).
     fn read_source(&self, n: u64, frames: usize, dest: &mut [f32]) {
-        debug_assert!(dest.len() >= frames * 2);
-        let l = &self.pcm.channel_data[0];
-        let r = &self.pcm.channel_data[1];
-        let pcm_len = self.map.pcm_len();
-
-        #[cfg(feature = "drift-injection")]
-        if crate::sabotage::mode() == crate::sabotage::Sabotage::PcmLengthLoop {
-            // Defect D2's audio half: modulo PCM length, ignoring beat space.
-            for k in 0..frames {
-                let idx = ((n + k as u64) % pcm_len) as usize;
-                dest[k * 2] = l[idx];
-                dest[k * 2 + 1] = r[idx];
-            }
-            return;
-        }
-
-        let mut n = n;
-        let mut filled = 0usize;
-        while filled < frames {
-            let remaining = (frames - filled) as u64;
-            let run = self.map.run_remaining(n).min(remaining);
-            let idx = self.map.pcm_index(n);
-            // The Bresenham long wrap can dictate one index past PCM that
-            // decoded at the floor length; clamp duplicates the last sample
-            // (sub-sample seam detail, never accumulated — spec §3.1).
-            let avail = pcm_len - idx;
-            let copy = run.min(avail) as usize;
-            let (idx, run) = (idx as usize, run as usize);
-            for k in 0..copy {
-                dest[(filled + k) * 2] = l[idx + k];
-                dest[(filled + k) * 2 + 1] = r[idx + k];
-            }
-            for k in copy..run {
-                dest[(filled + k) * 2] = l[pcm_len as usize - 1];
-                dest[(filled + k) * 2 + 1] = r[pcm_len as usize - 1];
-            }
-            filled += run;
-            n += run as u64;
-        }
+        read_pcm(&self.map, &self.pcm, n, frames, dest);
     }
 
     /// One-time anchor (spec §3.2): prime the stretcher with a seek window of
@@ -289,6 +320,8 @@ impl TrackState {
 pub struct AudioCore {
     frame: u64,
     playing: bool,
+    /// `F` frozen, epoch intact (spec §3.1). Only meaningful while `playing`.
+    paused: bool,
     timeline: Timeline,
     beats_per_bar: u32,
     tracks: [Option<Box<TrackState>>; MAX_TRACKS],
@@ -322,6 +355,7 @@ impl AudioCore {
         Self {
             frame: 0,
             playing: false,
+            paused: false,
             timeline,
             beats_per_bar: beats_per_bar.max(1),
             tracks: std::array::from_fn(|_| None),
@@ -379,17 +413,70 @@ impl AudioCore {
 
         self.apply_commands();
 
-        if self.playing {
+        // Hand back any PCM retired by a variation switch — even while
+        // stopped/paused (the reclaim queue may have been full last block).
+        for ts in self.tracks.iter_mut().flatten() {
+            if let Some(old) = ts.retired_pcm.take() {
+                if let Err(rtrb::PushError::Full(Reclaimable::Pcm(back))) =
+                    self.reclaim.push(Reclaimable::Pcm(old))
+                {
+                    ts.retired_pcm = Some(back);
+                }
+            }
+        }
+
+        if self.playing && !self.paused {
             let f0 = self.frame;
             let bu0 = self.timeline.bu(f0);
             let bu1 = self.timeline.bu(f0 + b as u64);
             let tempo = self.timeline.tempo_mbpm_at(f0);
             for slot in 0..MAX_TRACKS {
                 if let Some(ts) = self.tracks[slot].as_deref_mut() {
+                    // Quantized activation (spec §3.1): split the block at the
+                    // first frame F_q where bu(F_q) ≥ pending_bu — sample-exact
+                    // within the block, by exact integer inversion of bu.
+                    let mut offset = 0usize;
+                    if let Some(bu_q) = ts.pending_bu {
+                        if bu_q <= bu1 {
+                            let d = if bu_q <= bu0 {
+                                0
+                            } else {
+                                // Smallest d with bu0 + d·E ≥ bu_q. A block
+                                // spans exactly one tempo segment (changes
+                                // apply at block boundaries), so E is constant.
+                                (bu_q - bu0).div_ceil(tempo as u128) as usize
+                            };
+                            if d < b {
+                                ts.pending_bu = None;
+                                ts.active = true;
+                                ts.needs_anchor = true;
+                                ts.prev_unity = None;
+                                ts.ramp_remaining = ACTIVATION_RAMP_FRAMES;
+                                let f_q = f0 + d as u64;
+                                ts.last_wrap_count = ts.map.wrap_count(self.timeline.bu(f_q));
+                                let _ = self
+                                    .events
+                                    .push(RtEvent::Activated { slot: slot as u8, at_frame: f_q });
+                                offset = d;
+                            }
+                            // d == b: F_q is the next block's first frame —
+                            // activation happens there (bu_q == its bu0).
+                        }
+                    }
                     if !ts.active {
                         continue;
                     }
-                    render_track(ts, bu0, bu1, tempo, b, left, right);
+                    let bu_start =
+                        if offset == 0 { bu0 } else { self.timeline.bu(f0 + offset as u64) };
+                    render_track(
+                        ts,
+                        bu_start,
+                        bu1,
+                        tempo,
+                        b - offset,
+                        &mut left[offset..b],
+                        &mut right[offset..b],
+                    );
                     // Loop-wrap edge events (display/diagnostics only).
                     let w = ts.map.wrap_count(bu1);
                     if w > ts.last_wrap_count {
@@ -445,8 +532,10 @@ impl AudioCore {
                 RtCommand::Play => {
                     if !self.playing {
                         self.playing = true;
+                        self.paused = false;
                         for ts in self.tracks.iter_mut().flatten() {
                             ts.needs_anchor = true;
+                            ts.prev_unity = None;
                             if ts.active {
                                 ts.ramp_remaining = ACTIVATION_RAMP_FRAMES;
                             }
@@ -457,13 +546,18 @@ impl AudioCore {
                 RtCommand::Stop => {
                     if self.playing {
                         self.playing = false;
+                        self.paused = false;
                         let tempo = self.timeline.tempo_mbpm_at(self.frame);
                         // Explicit transport stop is one of the two epoch-reset
                         // flows (spec §3.1).
                         let _ = self.timeline.reset(self.frame, tempo);
                         for ts in self.tracks.iter_mut().flatten() {
                             ts.needs_anchor = true;
+                            ts.prev_unity = None;
                             ts.last_wrap_count = 0;
+                            // The epoch reset invalidates any quantized
+                            // activation target (it was a bu of the old epoch).
+                            ts.pending_bu = None;
                             #[cfg(feature = "drift-injection")]
                             {
                                 ts.float_cursor = None;
@@ -472,8 +566,37 @@ impl AudioCore {
                         let _ = self.events.push(RtEvent::Stopped);
                     }
                 }
+                RtCommand::Pause => {
+                    // F freezes for all tracks at once; no epoch reset, no
+                    // per-track state to touch (positions are derived).
+                    if self.playing && !self.paused {
+                        self.paused = true;
+                        let _ = self.events.push(RtEvent::Paused { at_frame: self.frame });
+                    }
+                }
+                RtCommand::Resume => {
+                    if self.playing && self.paused {
+                        self.paused = false;
+                        // Audio-only: a short ramp masks the resume edge (the
+                        // waveform was cut at the pause boundary). Positions
+                        // and stretcher streams continue exactly where they
+                        // froze — nothing is re-anchored.
+                        for ts in self.tracks.iter_mut().flatten() {
+                            if ts.active {
+                                ts.ramp_remaining = ts.ramp_remaining.max(ACTIVATION_RAMP_FRAMES);
+                            }
+                        }
+                        let _ = self.events.push(RtEvent::Resumed { at_frame: self.frame });
+                    }
+                }
                 RtCommand::SetTempo { mbpm } => {
-                    let _ = self.timeline.set_tempo(self.frame, mbpm);
+                    if self.timeline.set_tempo(self.frame, mbpm).is_ok() {
+                        // Tempo echo (spec §3.1): the exact application frame,
+                        // for the device analyzer's predicted onset grid.
+                        let _ = self
+                            .events
+                            .push(RtEvent::TempoApplied { mbpm, at_frame: self.frame });
+                    }
                 }
                 RtCommand::InstallTrack { slot, state } => {
                     let slot = slot as usize;
@@ -490,20 +613,82 @@ impl AudioCore {
                         let _ = self.reclaim.push(Reclaimable::Track(old));
                     }
                 }
-                RtCommand::Activate { slot } => {
+                RtCommand::Activate { slot, quantize } => {
                     let bu = self.timeline.bu(self.frame);
+                    let frame = self.frame;
+                    let bar_units = self.beats_per_bar as u128 * BEAT_UNITS_PER_BEAT;
                     if let Some(ts) = self.tracks.get_mut(slot as usize).and_then(Option::as_deref_mut) {
                         if !ts.active {
-                            ts.active = true;
-                            ts.needs_anchor = true;
-                            ts.ramp_remaining = ACTIVATION_RAMP_FRAMES;
-                            ts.last_wrap_count = ts.map.wrap_count(bu);
+                            match quantize {
+                                QuantizePolicy::Immediate => {
+                                    ts.active = true;
+                                    ts.needs_anchor = true;
+                                    ts.prev_unity = None;
+                                    ts.ramp_remaining = ACTIVATION_RAMP_FRAMES;
+                                    ts.last_wrap_count = ts.map.wrap_count(bu);
+                                    ts.pending_bu = None;
+                                    let _ = self
+                                        .events
+                                        .push(RtEvent::Activated { slot, at_frame: frame });
+                                }
+                                QuantizePolicy::NextBar => {
+                                    // Target the next bar boundary in beat-units
+                                    // (exactly-on-boundary activates this block:
+                                    // the render loop sees bu_q ≤ bu0). The
+                                    // frame F_q is inverted from bu by the
+                                    // render loop, against the segment in
+                                    // effect when the boundary is reached —
+                                    // robust to tempo changes in between.
+                                    ts.pending_bu = Some(bu.div_ceil(bar_units) * bar_units);
+                                }
+                            }
                         }
                     }
                 }
                 RtCommand::Deactivate { slot } => {
+                    let frame = self.frame;
                     if let Some(ts) = self.tracks.get_mut(slot as usize).and_then(Option::as_deref_mut) {
+                        if ts.active {
+                            let _ = self.events.push(RtEvent::Deactivated { slot, at_frame: frame });
+                        }
                         ts.active = false;
+                        ts.pending_bu = None;
+                    }
+                }
+                RtCommand::SetPitch { slot, semitones } => {
+                    if let Some(ts) = self.tracks.get_mut(slot as usize).and_then(Option::as_deref_mut) {
+                        // Audio-only: render_track applies it to the stretcher
+                        // (with the §4.8 combined-ratio clamp) and handles the
+                        // unity→stretch promotion crossfade.
+                        ts.pitch_semitones = semitones;
+                    }
+                }
+                RtCommand::SwapVariation { slot, variation, pcm } => {
+                    let frame = self.frame;
+                    let rendering = self.playing && !self.paused;
+                    if let Some(ts) = self.tracks.get_mut(slot as usize).and_then(Option::as_deref_mut) {
+                        let old = std::mem::replace(&mut ts.pcm, pcm);
+                        ts.variation = variation;
+                        ts.needs_anchor = true;
+                        if ts.active && rendering {
+                            // Crossfade against the outgoing PCM this block
+                            // (spec §3.2); it is reclaimed after the fade.
+                            if let Some(prev) = ts.xfade_old_pcm.replace(old) {
+                                // Double swap inside one block: the earlier
+                                // outgoing PCM never got its fade — reclaim it
+                                // (the loop guard guarantees a free slot).
+                                let _ = self.reclaim.push(Reclaimable::Pcm(prev));
+                            }
+                        } else {
+                            // Not audible: no crossfade — hand it back now.
+                            let _ = self.reclaim.push(Reclaimable::Pcm(old));
+                        }
+                        let _ = self
+                            .events
+                            .push(RtEvent::VariationApplied { slot, variation, at_frame: frame });
+                    } else {
+                        // No track at that slot: the new PCM itself goes back.
+                        let _ = self.reclaim.push(Reclaimable::Pcm(pcm));
                     }
                 }
             }
@@ -519,6 +704,7 @@ impl AudioCore {
                 tracks[slot] = RawTrackSnap {
                     occupied: true,
                     active: ts.active,
+                    variation: ts.variation,
                     loop_count: ts.map.wrap_count(bu) as u32,
                     loop_progress: crate::timeline::loop_progress_display(&ts.map, bu),
                     // Level metering lands with the M2 control surface; M0
@@ -534,6 +720,7 @@ impl AudioCore {
             frame: self.frame,
             tempo_mbpm: self.timeline.tempo_mbpm_at(self.frame),
             playing: self.playing,
+            paused: self.paused,
             timeline_epoch: self.timeline.epoch(),
             bar: (whole_beats / self.beats_per_bar as u64) as u32 + 1,
             beat_in_bar: (whole_beats % self.beats_per_bar as u64) as f32 + frac + 1.0,
@@ -589,8 +776,69 @@ pub extern "C" fn maestro_set_sabotage(mode: u8) {
     let _ = mode;
 }
 
+/// Read `frames` source samples of `pcm` starting at unwrapped sample `n`
+/// into `dest` (interleaved stereo), following the beat-space Bresenham wrap.
+/// Copies contiguous runs — cost is O(wraps in span), not O(samples). Free
+/// function so the variation crossfade can read the *outgoing* PCM through
+/// the same (validated-identical) map.
+fn read_pcm(map: &TrackTimeline, pcm: &PcmData, n: u64, frames: usize, dest: &mut [f32]) {
+    debug_assert!(dest.len() >= frames * 2);
+    let l = &pcm.channel_data[0];
+    let r = &pcm.channel_data[1];
+    let pcm_len = map.pcm_len();
+
+    #[cfg(feature = "drift-injection")]
+    if crate::sabotage::mode() == crate::sabotage::Sabotage::PcmLengthLoop {
+        // Defect D2's audio half: modulo PCM length, ignoring beat space.
+        for k in 0..frames {
+            let idx = ((n + k as u64) % pcm_len) as usize;
+            dest[k * 2] = l[idx];
+            dest[k * 2 + 1] = r[idx];
+        }
+        return;
+    }
+
+    let mut n = n;
+    let mut filled = 0usize;
+    while filled < frames {
+        let remaining = (frames - filled) as u64;
+        let run = map.run_remaining(n).min(remaining);
+        let idx = map.pcm_index(n);
+        // The Bresenham long wrap can dictate one index past PCM that
+        // decoded at the floor length; clamp duplicates the last sample
+        // (sub-sample seam detail, never accumulated — spec §3.1).
+        let avail = pcm_len - idx;
+        let copy = run.min(avail) as usize;
+        let (idx, run) = (idx as usize, run as usize);
+        for k in 0..copy {
+            dest[(filled + k) * 2] = l[idx + k];
+            dest[(filled + k) * 2 + 1] = r[idx + k];
+        }
+        for k in copy..run {
+            dest[(filled + k) * 2] = l[pcm_len as usize - 1];
+            dest[(filled + k) * 2 + 1] = r[pcm_len as usize - 1];
+        }
+        filled += run;
+        n += run as u64;
+    }
+}
+
 /// Render one active track into the mix. Free function so the borrow on the
 /// track is independent of `self` (the event queue is handled by the caller).
+/// Effective transpose under the §4.8 combined-ratio clamp: the combined
+/// time-pitch ratio must stay inside Signalsmith's clean-stretch bound
+/// [0.25, 4.0] so its RNG path (audio-value nondeterminism, spec §2.3#4) is
+/// never entered. Audio-only — floats never feed timing.
+#[inline]
+fn effective_transpose(pitch_semitones: f32, rate: f64) -> f32 {
+    if pitch_semitones == 0.0 {
+        return 0.0;
+    }
+    let lo = 12.0 * (0.25 / rate).log2();
+    let hi = 12.0 * (4.0 / rate).log2();
+    (pitch_semitones as f64).clamp(lo, hi) as f32
+}
+
 fn render_track(
     ts: &mut TrackState,
     bu0: u128,
@@ -600,8 +848,13 @@ fn render_track(
     left: &mut [f32],
     right: &mut [f32],
 ) {
+    if b == 0 {
+        return;
+    }
+    // Unity means O == E **exactly** (integer compare, spec §3.2) and no
+    // pitch shift — a pitch-shifted track is promoted to the stretch path.
     #[allow(unused_mut)]
-    let mut unity = ts.map.original_tempo_mbpm() == tempo_mbpm;
+    let mut unity = ts.map.original_tempo_mbpm() == tempo_mbpm && ts.pitch_semitones == 0.0;
 
     // Dictated span for this block (first difference — telescopes exactly).
     #[allow(unused_mut)]
@@ -638,6 +891,49 @@ fn render_track(
     debug_assert!(span <= MAX_FEED_FRAMES);
     let span = span.min(MAX_FEED_FRAMES);
 
+    // ---- Crossfade fade-out source (spec §3.2: one-block, equal-power). ----
+    // A variation swap takes priority (its discontinuity subsumes any path
+    // transition this block); otherwise a unity↔stretch flip fades between
+    // the old and new render paths. Audio-only — positions are derived and
+    // identical on both sides of every fade.
+    let mut fade_out = false;
+    if let Some(old_pcm) = ts.xfade_old_pcm.as_ref() {
+        // Outgoing variation, read 1:1 through the (validated-identical) map.
+        // At stretch rates these ≤ 10 ms play at source rate under the
+        // half-power tail — masked, like the anchor smear (spec §3.2).
+        let mut scratch = std::mem::take(&mut ts.xfade_scratch);
+        read_pcm(&ts.map, old_pcm, n0, b, &mut scratch);
+        ts.xfade_scratch = scratch;
+        fade_out = true;
+    } else {
+        match ts.prev_unity {
+            Some(true) if !unity => {
+                // bypass → stretch: fade out the bypass continuation (1:1
+                // from n0 — content-continuous with the previous block).
+                let mut scratch = std::mem::take(&mut ts.xfade_scratch);
+                ts.read_source(n0, b, &mut scratch);
+                ts.xfade_scratch = scratch;
+                fade_out = true;
+            }
+            Some(false) if unity && span > 0 && !ts.needs_anchor => {
+                // stretch → unity: fade out one more streamed stretch block
+                // (at unity the dictated span == b, so the ratio is already
+                // 1:1); the stretcher is then left until the next anchor.
+                let read_from = n0 + ts.stretcher.input_latency() as u64;
+                let mut feed = std::mem::take(&mut ts.feed_scratch);
+                ts.read_source(read_from, span, &mut feed);
+                ts.feed_scratch = feed;
+                let mut scratch = std::mem::take(&mut ts.xfade_scratch);
+                let _ = ts
+                    .stretcher
+                    .process_interleaved(&ts.feed_scratch[..span * 2], &mut scratch[..b * 2]);
+                ts.xfade_scratch = scratch;
+                fade_out = true;
+            }
+            _ => {}
+        }
+    }
+
     // Mix parameters lifted out before `rendered` borrows the scratch buffers.
     let theta = (ts.pan.clamp(-1.0, 1.0) + 1.0) * std::f32::consts::FRAC_PI_4;
     let (gl, gr) = (theta.cos() * ts.gain, theta.sin() * ts.gain);
@@ -653,10 +949,17 @@ fn render_track(
         ts.needs_anchor = true; // leaving unity later must re-anchor
         &ts.feed_scratch[..b * 2]
     } else {
+        let rate = tempo_mbpm as f64 / ts.map.original_tempo_mbpm() as f64;
         if ts.needs_anchor {
-            let rate = tempo_mbpm as f64 / ts.map.original_tempo_mbpm() as f64;
             ts.anchor(n0, rate);
             ts.needs_anchor = false;
+        }
+        // Pitch (spec §3.2): set_transpose_semitones, re-applied only when the
+        // effective value changes (tempo changes move the §4.8 clamp window).
+        let desired = effective_transpose(ts.pitch_semitones, rate);
+        if ts.applied_pitch != Some(desired) {
+            let _ = ts.stretcher.set_transpose_semitones(desired);
+            ts.applied_pitch = Some(desired);
         }
         // The seek window already primed input up to u + input_latency;
         // streaming continues from there. Re-feeding from u would double-feed
@@ -682,9 +985,12 @@ fn render_track(
         }
         &ts.out_scratch[..b * 2]
     };
+    ts.prev_unity = Some(unity);
 
-    // Equal-power pan + gain + activation ramp, mixed into the output bus.
+    // Equal-power pan + gain + activation ramp (+ one-block equal-power
+    // crossfade when a fade-out source was rendered), mixed into the bus.
     let ramp_total = ACTIVATION_RAMP_FRAMES as f32;
+    let inv_b = 1.0 / b as f32;
     for i in 0..b {
         let g = if ramp_remaining > 0 {
             let g = 1.0 - ramp_remaining as f32 / ramp_total;
@@ -693,8 +999,27 @@ fn render_track(
         } else {
             1.0
         };
-        left[i] += rendered[i * 2] * gl * g;
-        right[i] += rendered[i * 2 + 1] * gr * g;
+        let (l_s, r_s) = if fade_out {
+            let t = (i as f32 + 0.5) * inv_b * std::f32::consts::FRAC_PI_2;
+            let (g_in, g_out) = (t.sin(), t.cos());
+            (
+                rendered[i * 2] * g_in + ts.xfade_scratch[i * 2] * g_out,
+                rendered[i * 2 + 1] * g_in + ts.xfade_scratch[i * 2 + 1] * g_out,
+            )
+        } else {
+            (rendered[i * 2], rendered[i * 2 + 1])
+        };
+        left[i] += l_s * gl * g;
+        right[i] += r_s * gr * g;
     }
     ts.ramp_remaining = ramp_remaining;
+
+    // The variation fade has consumed its outgoing PCM: stage it for the
+    // reclaim queue (drained at the top of every render — never dropped on
+    // the audio thread). If a previous retiree is still waiting (reclaim
+    // queue jammed), keep the fade source in place; the fade repeats next
+    // block — degraded audio, never a drop.
+    if fade_out && ts.xfade_old_pcm.is_some() && ts.retired_pcm.is_none() {
+        ts.retired_pcm = ts.xfade_old_pcm.take();
+    }
 }

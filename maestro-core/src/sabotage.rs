@@ -14,6 +14,10 @@
 //!   (defect D2, the structural drift root — spec §2.2).
 //! - `TimerClock` — advance `F` from a jittery simulated wall timer instead
 //!   of rendered frames (defect D8 — spec §3.3).
+//! - `StaleReanchor` — apply a tempo change as if re-anchored from a stale
+//!   clock (defect D7: the branch's control plane re-anchored tracks from a
+//!   float beat clock through a 5–20 ms async bridge; all three post-M5 sync
+//!   bugs were this). Covers the M1 tempo-change legs of T-INV.
 
 use std::sync::atomic::{AtomicU8, Ordering};
 
@@ -28,6 +32,11 @@ pub enum Sabotage {
     /// 1:1 (wrong rate). The C0 device checkpoint's cross-tempo scenario must
     /// FAIL its analysis against a build running this mode (spec §6.1).
     StretchDisabled = 4,
+    /// Defect D7 class: a tempo change anchored from a **stale clock** — the
+    /// new segment's `start_bu` is computed ~1024 frames in the past, making
+    /// `bu` discontinuous at the change. T-INV's M1 tempo-change legs must
+    /// detect the resulting position jump at the next checkpoint.
+    StaleReanchor = 5,
 }
 
 static MODE: AtomicU8 = AtomicU8::new(0);
@@ -43,10 +52,11 @@ pub fn mode() -> Sabotage {
         2 => Sabotage::PcmLengthLoop,
         3 => Sabotage::TimerClock,
         4 => Sabotage::StretchDisabled,
+        5 => Sabotage::StaleReanchor,
         _ => Sabotage::None,
     }
 }
 
 pub(crate) fn set_mode_raw(mode: u8) {
-    MODE.store(if mode <= 4 { mode } else { 0 }, Ordering::SeqCst);
+    MODE.store(if mode <= 5 { mode } else { 0 }, Ordering::SeqCst);
 }

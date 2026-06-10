@@ -194,7 +194,17 @@ impl Timeline {
         if mbpm == last.mbpm {
             return Ok(()); // no-op change; keep the table minimal
         }
-        let start_bu = self.bu(at_frame);
+        #[allow(unused_mut)]
+        let mut start_bu = self.bu(at_frame);
+        #[cfg(feature = "drift-injection")]
+        if crate::sabotage::mode() == crate::sabotage::Sabotage::StaleReanchor {
+            // Defect class D7: the change is anchored from a clock read ~1024
+            // frames (≈ 21 ms — the branch's async-bridge window) in the past,
+            // so bu becomes discontinuous at the change. T-INV must detect the
+            // resulting position jump (spec §6.2 negative controls).
+            let stale = at_frame.saturating_sub(1024).max(last.start_frame);
+            start_bu = self.bu(stale);
+        }
         if at_frame == last.start_frame {
             // Two changes at the same boundary: the later one wins; start_bu
             // is unchanged because bu(at_frame) is segment-start exact.

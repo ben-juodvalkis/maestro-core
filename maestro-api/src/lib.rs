@@ -16,10 +16,11 @@
 //! maestro_render(core, buffers, frames)                   // C ABI, audio thread only
 //! ```
 //!
-//! **M0 scope:** the walking-skeleton subset — transport play/stop, init-time
-//! tempo, track install/activate/deactivate, snapshot, edge events. Breadth
-//! (volume/pan/pitch/variations/safety presets) lands in M2 as additional
-//! variants; adding an operation = one enum variant + one match arm.
+//! **M1 scope:** the full timing surface (spec §5 M1) — live tempo changes,
+//! pause/resume, quantized and immediate activation, per-track pitch, and
+//! variation switching. Remaining breadth (volume/pan/mute/solo, full track
+//! lifecycle, safety presets) lands in M2 as additional variants; adding an
+//! operation = one enum variant + one match arm.
 
 use serde::{Deserialize, Serialize};
 
@@ -50,18 +51,52 @@ pub enum Command {
     /// Stop the transport and reset the timeline epoch (bar 1 beat 1).
     /// Individually deactivating the last audible track does NOT do this (spec §3.1).
     Stop,
-    /// Set engine tempo in milli-BPM. M0: accepted only while stopped
-    /// (live tempo changes are M1). Clamped range 40_000..=300_000 (spec §4.8);
-    /// out-of-range is rejected with an error result, never clamped silently.
+    /// Freeze the master clock `F` — for all tracks at once, with **no epoch
+    /// reset** (distinct from `Stop`, spec §3.1). Positions are derived from
+    /// `F`, so pause cannot desync anything; `Resume` simply lets `F` continue.
+    /// Interruptions map to this command (spec §4.9).
+    Pause,
+    /// Continue from `Pause`. Nothing is re-anchored — there is nothing to
+    /// re-anchor (positions are computed, never advanced).
+    Resume,
+    /// Set engine tempo in milli-BPM, **live or stopped** (M1). Applied at the
+    /// next block boundary; `bu` is continuous across the change by
+    /// construction (spec §3.1). The engine echoes the applied value via
+    /// `Event::TempoApplied` with the exact application frame.
+    /// Clamped range 40_000..=300_000 (spec §4.8); out-of-range is rejected
+    /// with an error result, never clamped silently.
     SetTempo { mbpm: u32 },
-    /// Make an installed track audible. M0 quantize policy: immediate
-    /// (sample-exact within the current block, under an activation ramp).
-    Activate { slot: u8 },
+    /// Make an installed track audible. `quantize` chooses the activation
+    /// frame policy; the engine computes the frame — JS never does (spec §3.5).
+    Activate {
+        slot: u8,
+        #[serde(default)]
+        quantize: QuantizePolicy,
+    },
     /// Silence a track. Its musical position remains derived from the timeline;
     /// reactivation cannot desync by construction (spec §3.2).
     Deactivate { slot: u8 },
     /// Remove a track and free its slot. PCM is reclaimed off the audio thread.
     RemoveTrack { slot: u8 },
+    /// Per-track pitch shift in semitones (spec §3.2 / §4.8: ±12, rejected —
+    /// never clamped — outside that range). A pitch shift on a unity track
+    /// promotes it to the stretch path under the one-block crossfade; position
+    /// math is unaffected.
+    SetPitch { slot: u8, semitones: f32 },
+}
+
+/// Activation-frame policy for [`Command::Activate`] (spec §3.1):
+/// `Immediate` activates at the current block (sample-exact under the
+/// activation ramp); `NextBar` computes the activation frame `F_q` by exact
+/// integer inversion of `bu` and splits the render block at `F_q` so
+/// activation is sample-exact within a block.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
+pub enum QuantizePolicy {
+    #[default]
+    Immediate,
+    NextBar,
 }
 
 /// Result of `dispatch`, returned as JSON.
@@ -90,6 +125,14 @@ pub struct LoadMeta {
     pub end_padding: u32,
     /// Real audio length in samples as authored (pre-encode).
     pub original_samples: u64,
+    /// Variation index of this file. Loading a different variation into an
+    /// occupied slot performs an engine-side variation switch (Arc PCM swap +
+    /// re-anchor + one-block crossfade at a block boundary, spec §3.2); all
+    /// variations of a stem must declare identical musical identity
+    /// (`loop_beats` / `original_samples` / `original_tempo_mbpm`) or the
+    /// load fails loudly (spec §3.4).
+    #[serde(default)]
+    pub variation: u8,
     /// Initial gain/pan so M0 can hard-pan the metronome stems without a mixer surface.
     pub gain: f32,
     pub pan: f32,
@@ -105,6 +148,20 @@ pub enum Event {
     TrackLoadFailed { slot: u8, reason: String },
     Started,
     Stopped,
+    /// `F` froze at `at_frame` (no epoch reset — distinct from `Stopped`).
+    Paused { at_frame: u64 },
+    Resumed { at_frame: u64 },
+    /// Tempo echo (spec §3.1/§3.5): the engine applied `mbpm` at exactly
+    /// `at_frame` (the block boundary where the segment was appended). The
+    /// device analyzer derives the expected onset grid from this, never from
+    /// wall-clock assumptions (spec §6.4).
+    TempoApplied { mbpm: u32, at_frame: u64 },
+    /// A track became audible at exactly `at_frame` (immediate activation, or
+    /// the quantized activation frame `F_q` for `QuantizePolicy::NextBar`).
+    TrackActivated { slot: u8, at_frame: u64 },
+    TrackDeactivated { slot: u8, at_frame: u64 },
+    /// Variation switch applied at a block boundary (spec §3.2).
+    VariationApplied { slot: u8, variation: u8, at_frame: u64 },
     LoopWrapped { slot: u8, wrap_count: u32 },
     Underrun,
     BudgetExceeded { render_ns: u64, period_ns: u64 },
@@ -116,6 +173,8 @@ pub enum Event {
 pub enum TransportState {
     Stopped,
     Playing,
+    /// `F` frozen, timeline epoch intact (spec §3.1).
+    Paused,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -135,6 +194,8 @@ pub enum TrackStatus {
 pub struct TrackSnap {
     pub slot: u8,
     pub status: TrackStatus,
+    /// Currently rendering variation (spec §3.5).
+    pub variation: u8,
     pub loop_count: u32,
     /// Derived from bu(F) mod Λ. Display only — floats never feed timing.
     pub loop_progress: f32,

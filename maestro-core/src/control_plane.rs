@@ -65,11 +65,29 @@ impl Reconciliation {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// §4.8 rate clamp: every loaded track's implicit rate `E/O` must stay inside
+/// [0.25, 4.0]. Checked at load (against the current tempo) and at SetTempo
+/// (against every loaded track) — out-of-range is rejected, never clamped.
+const MAX_RATE_NUM: u64 = 4; // rate ≤ 4.0  ⇔  E ≤ 4·O
+const MAX_RATE_DEN: u64 = 4; // rate ≥ 0.25 ⇔  4·E ≥ O
+
+/// §4.8 pitch clamp: ±12 semitones; out-of-range commands are rejected.
+const MAX_PITCH_SEMITONES: f32 = 12.0;
+
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 enum SlotState {
     #[default]
     Empty,
-    Loaded,
+    /// Control-side mirror of the installed track's immutable musical
+    /// identity, used to validate variation switches (spec §3.4: all
+    /// variations of a stem must declare identical identity) and tempo
+    /// commands (§4.8 rate clamp).
+    Loaded {
+        o_mbpm: u32,
+        loop_beats: u32,
+        original_samples: u64,
+        variation: u8,
+    },
 }
 
 /// The control-plane handle. One per engine instance; not `Sync` — the FFI
@@ -80,11 +98,27 @@ pub struct ControlPlane {
     reclaim: rtrb::Consumer<Reclaimable>,
     snapshot: Arc<SeqLock<RawSnapshot>>,
     config: EngineConfig,
+    /// Control-side mirror of the last accepted tempo, for §4.8 load-time
+    /// rate validation. The snapshot lags by a block; this mirror is always
+    /// consistent with the command stream this plane has issued.
+    tempo_mbpm: u32,
     /// Control-side mirror for validation only (is the slot loaded?); the
     /// authoritative runtime state is the audio core's.
     slots: [SlotState; MAX_TRACKS],
     /// Events originated control-side (loads), merged into `drain_events`.
     pending_events: Vec<Event>,
+}
+
+/// §4.8 rate-clamp check, in integers: `0.25 ≤ E/O ≤ 4` ⇔ `4E ≥ O ∧ E ≤ 4O`.
+fn rate_in_range(tempo_mbpm: u32, o_mbpm: u32, slot: usize) -> Result<(), String> {
+    let (e, o) = (tempo_mbpm as u64, o_mbpm as u64);
+    if e * MAX_RATE_DEN < o || e > o * MAX_RATE_NUM {
+        return Err(format!(
+            "tempo {tempo_mbpm} mBPM puts slot {slot} (original {o_mbpm} mBPM) outside the \
+             rate clamp [0.25, 4.0] (spec §4.8)"
+        ));
+    }
+    Ok(())
 }
 
 /// Create an engine pair: the control plane stays with the caller; the
@@ -118,6 +152,7 @@ pub fn create_engine(config: EngineConfig) -> Result<(ControlPlane, Box<AudioCor
         events: evt_rx,
         reclaim: rec_rx,
         snapshot,
+        tempo_mbpm: config.initial_tempo_mbpm,
         config,
         slots: [SlotState::default(); MAX_TRACKS],
         pending_events: Vec::new(),
@@ -139,22 +174,28 @@ impl ControlPlane {
                         ),
                     };
                 }
-                // M0: live tempo changes are M1 scope. The core applies tempo
-                // at block boundaries already, but the product gate lives here.
-                if self.raw_snapshot().playing {
-                    return CommandResult::Rejected {
-                        reason: "live tempo changes land in M1; stop the transport first".into(),
-                    };
+                // §4.8: every loaded track's rate E/O must stay in [0.25, 4].
+                // Live tempo changes are M1 surface — applied at the next
+                // block boundary; the engine echoes Event::TempoApplied.
+                for (slot, s) in self.slots.iter().enumerate() {
+                    if let SlotState::Loaded { o_mbpm, .. } = s {
+                        if let Err(reason) = rate_in_range(*mbpm, *o_mbpm, slot) {
+                            return CommandResult::Rejected { reason };
+                        }
+                    }
                 }
+                self.tempo_mbpm = *mbpm;
                 self.send(RtCommand::SetTempo { mbpm: *mbpm });
             }
             Command::Play => self.send(RtCommand::Play),
             Command::Stop => self.send(RtCommand::Stop),
-            Command::Activate { slot } => {
+            Command::Pause => self.send(RtCommand::Pause),
+            Command::Resume => self.send(RtCommand::Resume),
+            Command::Activate { slot, quantize } => {
                 if let Err(r) = self.expect_loaded(*slot) {
                     return r;
                 }
-                self.send(RtCommand::Activate { slot: *slot });
+                self.send(RtCommand::Activate { slot: *slot, quantize: *quantize });
             }
             Command::Deactivate { slot } => {
                 if let Err(r) = self.expect_loaded(*slot) {
@@ -168,6 +209,20 @@ impl ControlPlane {
                 }
                 self.slots[*slot as usize] = SlotState::Empty;
                 self.send(RtCommand::RemoveTrack { slot: *slot });
+            }
+            Command::SetPitch { slot, semitones } => {
+                if let Err(r) = self.expect_loaded(*slot) {
+                    return r;
+                }
+                // §4.8: ±12 semitones, rejected (never clamped) outside.
+                if !semitones.is_finite() || semitones.abs() > MAX_PITCH_SEMITONES {
+                    return CommandResult::Rejected {
+                        reason: format!(
+                            "pitch {semitones} semitones outside ±{MAX_PITCH_SEMITONES} (spec §4.8)"
+                        ),
+                    };
+                }
+                self.send(RtCommand::SetPitch { slot: *slot, semitones: *semitones });
             }
         }
         CommandResult::Ok
@@ -229,12 +284,57 @@ impl ControlPlane {
         let map = TrackTimeline::new(meta.original_tempo_mbpm, meta.loop_beats, meta.original_samples)
             .map_err(|e| e.to_string())?;
 
+        // §4.8: the track's implicit rate at the current engine tempo must be
+        // inside [0.25, 4.0] — rejected here, never discovered mid-render.
+        rate_in_range(self.tempo_mbpm, meta.original_tempo_mbpm, meta.slot as usize)?;
+
         let pcm = Arc::new(PcmData {
             length_samples: left.len() as u64,
             channel_data: vec![left, right],
             sample_rate: ENGINE_SAMPLE_RATE,
             num_channels: 2,
         });
+
+        // Variation switch (spec §3.2): loading a different variation into an
+        // occupied slot swaps the PCM engine-side (Arc swap + re-anchor +
+        // one-block crossfade at a block boundary). All variations of a stem
+        // must declare identical musical identity (spec §3.4) — anything else
+        // is a hard failure, because loop length can never change underneath
+        // the timeline (kills D9/D10).
+        if let SlotState::Loaded { o_mbpm, loop_beats, original_samples, variation } =
+            self.slots[meta.slot as usize]
+        {
+            if variation != meta.variation {
+                if o_mbpm != meta.original_tempo_mbpm
+                    || loop_beats != meta.loop_beats
+                    || original_samples != meta.original_samples
+                {
+                    return Err(format!(
+                        "variation {} identity mismatch on slot {}: installed \
+                         (O={o_mbpm}, loop_beats={loop_beats}, original_samples={original_samples}) \
+                         vs incoming (O={}, loop_beats={}, original_samples={}) — all variations \
+                         of a stem must be musically identical (spec §3.4)",
+                        meta.variation,
+                        meta.slot,
+                        meta.original_tempo_mbpm,
+                        meta.loop_beats,
+                        meta.original_samples,
+                    ));
+                }
+                self.send(RtCommand::SwapVariation {
+                    slot: meta.slot,
+                    variation: meta.variation,
+                    pcm,
+                });
+                self.slots[meta.slot as usize] = SlotState::Loaded {
+                    o_mbpm,
+                    loop_beats,
+                    original_samples,
+                    variation: meta.variation,
+                };
+                return Ok(reconciliation);
+            }
+        }
 
         // Per-track stretcher (spec §4.3), preconfigured and preallocated here
         // so the audio thread never allocates.
@@ -253,11 +353,17 @@ impl ControlPlane {
             pcm,
             meta.gain,
             meta.pan,
+            meta.variation,
             stretcher,
         ));
 
         self.send(RtCommand::InstallTrack { slot: meta.slot, state });
-        self.slots[meta.slot as usize] = SlotState::Loaded;
+        self.slots[meta.slot as usize] = SlotState::Loaded {
+            o_mbpm: meta.original_tempo_mbpm,
+            loop_beats: meta.loop_beats,
+            original_samples: meta.original_samples,
+            variation: meta.variation,
+        };
         Ok(reconciliation)
     }
 
@@ -273,6 +379,7 @@ impl ControlPlane {
             .map(|(slot, t)| TrackSnap {
                 slot: slot as u8,
                 status: if t.active { TrackStatus::Active } else { TrackStatus::Loaded },
+                variation: t.variation,
                 loop_count: t.loop_count,
                 loop_progress: t.loop_progress,
                 rms_l: t.rms_l,
@@ -284,7 +391,13 @@ impl ControlPlane {
         Snapshot {
             engine_frame: raw.frame,
             tempo_mbpm: raw.tempo_mbpm,
-            transport: if raw.playing { TransportState::Playing } else { TransportState::Stopped },
+            transport: if raw.playing && raw.paused {
+                TransportState::Paused
+            } else if raw.playing {
+                TransportState::Playing
+            } else {
+                TransportState::Stopped
+            },
             bar: raw.bar,
             beat_in_bar: raw.beat_in_bar,
             timeline_epoch: raw.timeline_epoch,
@@ -309,6 +422,16 @@ impl ControlPlane {
             out.push(match e {
                 RtEvent::Started => Event::Started,
                 RtEvent::Stopped => Event::Stopped,
+                RtEvent::Paused { at_frame } => Event::Paused { at_frame },
+                RtEvent::Resumed { at_frame } => Event::Resumed { at_frame },
+                RtEvent::TempoApplied { mbpm, at_frame } => Event::TempoApplied { mbpm, at_frame },
+                RtEvent::Activated { slot, at_frame } => Event::TrackActivated { slot, at_frame },
+                RtEvent::Deactivated { slot, at_frame } => {
+                    Event::TrackDeactivated { slot, at_frame }
+                }
+                RtEvent::VariationApplied { slot, variation, at_frame } => {
+                    Event::VariationApplied { slot, variation, at_frame }
+                }
                 RtEvent::LoopWrapped { slot, wrap_count } => Event::LoopWrapped { slot, wrap_count },
                 RtEvent::BudgetExceeded { render_ns, period_ns } => {
                     Event::BudgetExceeded { render_ns, period_ns }
@@ -327,7 +450,9 @@ impl ControlPlane {
     }
 
     fn expect_loaded(&self, slot: u8) -> Result<(), CommandResult> {
-        if (slot as usize) < MAX_TRACKS && self.slots[slot as usize] == SlotState::Loaded {
+        if (slot as usize) < MAX_TRACKS
+            && matches!(self.slots[slot as usize], SlotState::Loaded { .. })
+        {
             Ok(())
         } else {
             Err(CommandResult::Rejected { reason: format!("slot {slot} has no loaded track") })

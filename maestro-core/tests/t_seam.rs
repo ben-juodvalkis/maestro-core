@@ -62,6 +62,19 @@ fn beat_frames(tempo_mbpm: u32) -> u64 {
 /// Build a one-track engine, press play, render `total_frames`, return the
 /// left channel capture.
 fn render_capture(tempo_mbpm: u32, left: Vec<f32>, right: Vec<f32>, total_frames: u64) -> Vec<f32> {
+    render_capture_with_changes(tempo_mbpm, left, right, total_frames, &[])
+}
+
+/// Like [`render_capture`], dispatching live tempo changes at the given
+/// frames. Each change frame must be a multiple of BLOCK so the change lands
+/// exactly at a block boundary (where the engine applies commands).
+fn render_capture_with_changes(
+    tempo_mbpm: u32,
+    left: Vec<f32>,
+    right: Vec<f32>,
+    total_frames: u64,
+    tempo_changes: &[(u64, u32)],
+) -> Vec<f32> {
     let (mut plane, mut core) = create_engine(EngineConfig {
         sample_rate: SAMPLE_RATE,
         initial_tempo_mbpm: tempo_mbpm,
@@ -77,6 +90,7 @@ fn render_capture(tempo_mbpm: u32, left: Vec<f32>, right: Vec<f32>, total_frames
                 encoder_delay: 0,
                 end_padding: 0,
                 original_samples: left.len() as u64,
+                variation: 0,
                 gain: 1.0,
                 pan: 0.0,
             },
@@ -84,14 +98,24 @@ fn render_capture(tempo_mbpm: u32, left: Vec<f32>, right: Vec<f32>, total_frames
             right,
         )
         .unwrap();
-    assert!(matches!(plane.dispatch(Command::Activate { slot: 0 }), CommandResult::Ok));
+    assert!(matches!(plane.dispatch(Command::Activate { slot: 0, quantize: maestro_api::QuantizePolicy::Immediate }), CommandResult::Ok));
     assert!(matches!(plane.dispatch(Command::Play), CommandResult::Ok));
 
     let mut capture = Vec::with_capacity(total_frames as usize);
     let mut l = vec![0.0f32; BLOCK];
     let mut r = vec![0.0f32; BLOCK];
     let mut rendered = 0u64;
+    let mut change_idx = 0usize;
     while rendered < total_frames {
+        if let Some(&(at, mbpm)) = tempo_changes.get(change_idx) {
+            if rendered == at {
+                let res = plane.dispatch(Command::SetTempo { mbpm });
+                assert!(matches!(res, CommandResult::Ok), "tempo change rejected: {res:?}");
+                change_idx += 1;
+            } else {
+                assert!(rendered < at, "change frame {at} not block-aligned (BLOCK={BLOCK})");
+            }
+        }
         let b = BLOCK.min((total_frames - rendered) as usize);
         core.render(&mut l[..b], &mut r[..b]);
         capture.extend_from_slice(&l[..b]);
@@ -242,6 +266,175 @@ fn t_seam_metronome_onset_grid_all_rates() {
                 );
                 assert!(off.abs() <= BYPASS_GRID_TOLERANCE);
             }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// (c) Across a live tempo change (checkpoint C1, spec §5 M1 / §6.3):
+//     seams stay continuous and onsets stay on the derived segment-table
+//     grid through stretch→stretch, stretch→unity, and unity→stretch
+//     changes (the latter two exercising the one-block crossfade, §3.2).
+// ---------------------------------------------------------------------------
+
+/// (label, tempo before, tempo after) — covering a span-only change and both
+/// crossfade directions of the unity transition.
+const CHANGE_CASES: [(&str, u32, u32); 3] = [
+    ("stretch→stretch (0.75→1.5)", 90_000, 180_000),
+    ("stretch→unity (0.75→1.0)", 90_000, 120_000),
+    ("unity→stretch (1.0→1.5)", 120_000, 180_000),
+];
+
+/// Wraps rendered per side; both sides analyzed (minus the first wrap of the
+/// capture and the first wrap after the change) total ≥ 50 wraps.
+const WRAPS_PER_SIDE: u64 = 27;
+
+/// The change lands mid-wrap, mid-beat (the hard case: nothing is aligned).
+fn change_frame(tempo_a: u32) -> u64 {
+    wrap_frames(tempo_a) * (WRAPS_PER_SIDE - 1) + beat_frames(tempo_a) * 5 + beat_frames(tempo_a) / 2
+}
+
+#[test]
+fn t_seam_sine_continuity_across_tempo_change() {
+    let (sine_l, sine_r) = make_sine_pcm(PCM_LEN, SINE_HZ);
+    let natural = natural_max_step(&sine_l);
+
+    for (label, tempo_a, tempo_b) in CHANGE_CASES {
+        let f_change = change_frame(tempo_a);
+        let total = f_change + wrap_frames(tempo_b) * WRAPS_PER_SIDE;
+        let capture = render_capture_with_changes(
+            tempo_a,
+            sine_l.clone(),
+            sine_r.clone(),
+            total,
+            &[(f_change, tempo_b)],
+        );
+
+        // Anti-stub (§6.1): audible on both sides of the change.
+        for (side, range) in [
+            ("before", wrap_frames(tempo_a) as usize..f_change as usize),
+            ("after", f_change as usize..capture.len()),
+        ] {
+            let seg = &capture[range];
+            let rms = (seg.iter().map(|s| (*s as f64).powi(2)).sum::<f64>() / seg.len() as f64)
+                .sqrt();
+            assert!(rms > MIN_MIX_RMS, "{label}: silent render {side} the change");
+        }
+
+        // Spec §3.2: a tempo change only changes the dictated span — no
+        // re-anchor, no phase reset, no transient. The unity transitions ride
+        // the one-block equal-power crossfade of two content-continuous
+        // signals. The same seam bound holds across the ENTIRE capture,
+        // change block included (wrap 0 excluded as ever: activation ramp).
+        let (max_step, at) = max_step_from(&capture, wrap_frames(tempo_a) as usize);
+        let limit = natural * SEAM_STEP_FACTOR;
+        assert!(
+            max_step <= limit,
+            "{label}: max inter-sample step {max_step} at frame {at} exceeds \
+             {SEAM_STEP_FACTOR}× natural ({limit}) — transient across the tempo change \
+             (change at {f_change})"
+        );
+    }
+}
+
+#[test]
+fn t_seam_metronome_onset_grid_across_tempo_change() {
+    let wav = load_float_wav(&fixture_path("metronome_120.wav")).unwrap();
+    assert_eq!(wav.frames as u64, PCM_LEN);
+
+    for (label, tempo_a, tempo_b) in CHANGE_CASES {
+        let f_change = change_frame(tempo_a);
+        let total = f_change + wrap_frames(tempo_b) * WRAPS_PER_SIDE;
+        let capture = render_capture_with_changes(
+            tempo_a,
+            wav.channels[0].clone(),
+            wav.channels[1].clone(),
+            total,
+            &[(f_change, tempo_b)],
+        );
+
+        // Predicted beat grid from the segment table (bu continuous across
+        // the change): beat m sounds at the frame where bu crosses m·K. The
+        // tempo pairs are chosen so every grid frame is exact (asserted).
+        let bu_c = f_change as u128 * tempo_a as u128;
+        let grid: Vec<u64> = (0..)
+            .map(|m| {
+                let target = m as u128 * BEAT_UNITS_PER_BEAT;
+                if target <= bu_c {
+                    assert_eq!(target % tempo_a as u128, 0, "{label}: pre-change grid inexact");
+                    (target / tempo_a as u128) as u64
+                } else {
+                    assert_eq!(
+                        (target - bu_c) % tempo_b as u128,
+                        0,
+                        "{label}: post-change grid inexact"
+                    );
+                    f_change + ((target - bu_c) / tempo_b as u128) as u64
+                }
+            })
+            .take_while(|&f| f < total)
+            .collect();
+
+        let min_gap = (beat_frames(tempo_a).min(beat_frames(tempo_b)) / 2) as usize;
+        let onsets = detect_click_onsets(&capture, ONSET_THRESHOLD, min_gap);
+
+        // Two analysis windows: [wrap 1, change) and [change + 1 wrap, end) —
+        // the first wrap of the capture (activation ramp + anchor pre-roll)
+        // and the first wrap after the change (crossfade + vocoder
+        // re-settling smear, bounded by the constant window) are excluded
+        // from the grid assertions; the COUNT gate below still spans the
+        // transition, so a dropped or doubled click there cannot hide.
+        let windows = [
+            ("before", wrap_frames(tempo_a), f_change),
+            ("after", f_change + wrap_frames(tempo_b), total),
+        ];
+
+        // Anti-stub count gate across the whole capture (minus wrap 0): one
+        // onset per predicted beat, exactly.
+        let expected_total = grid.iter().filter(|&&g| g >= wrap_frames(tempo_a)).count();
+        let detected_total = onsets.iter().filter(|&&o| o as u64 >= wrap_frames(tempo_a)).count();
+        assert!(
+            (expected_total as i64 - detected_total as i64).abs() <= 1,
+            "{label}: expected {expected_total} onsets after wrap 0, detected {detected_total} \
+             — a click was lost or doubled somewhere (possibly at the change)"
+        );
+
+        for (side, from, to) in windows {
+            let pred: Vec<u64> = grid.iter().copied().filter(|&g| g >= from && g < to).collect();
+            let got: Vec<u64> =
+                onsets.iter().map(|&o| o as u64).filter(|&o| o >= from && o < to).collect();
+            assert_eq!(
+                got.len(),
+                pred.len(),
+                "{label} ({side}): onset count {} != predicted {}",
+                got.len(),
+                pred.len()
+            );
+
+            let offsets: Vec<i64> =
+                got.iter().zip(&pred).map(|(&o, &p)| o as i64 - p as i64).collect();
+            let spread = offsets.iter().max().unwrap() - offsets.iter().min().unwrap();
+            assert!(
+                spread <= STRETCH_ONSET_JITTER_MAX,
+                "{label} ({side}): onset offset spread {spread} exceeds bounded-smear gate"
+            );
+
+            // Exact periodicity per tempo segment = the zero-drift assertion
+            // (spec §6.3b): any sample lost or gained breaks it, as does any
+            // slope. Periodicity is asserted per side — the smear pattern is
+            // a function of the click phase against the hop grid, which the
+            // tempo change legitimately re-phases.
+            let period = (1..=MAX_ONSET_PATTERN_PERIOD_BEATS).find(|&p| {
+                offsets.len() > p
+                    && offsets.iter().zip(offsets.iter().skip(p)).all(|(a, b)| a == b)
+            });
+            assert!(
+                period.is_some(),
+                "{label} ({side}): onset offsets APERIODIC over {} beats — accumulation \
+                 (drift) present: {:?}…",
+                offsets.len(),
+                &offsets[..offsets.len().min(LOOP_BEATS as usize)]
+            );
         }
     }
 }
