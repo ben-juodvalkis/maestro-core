@@ -15,6 +15,14 @@
 //! 8. Signalsmith Stretch           — native C++ linkage
 //! 9. WASM compilation target       — wasm-bindgen exports
 
+// Native rebuild (documentation/specs/native-audio-rebuild.md):
+// the single timing authority — derived integer positions, no advanced cursors.
+pub mod timeline;
+
+// T-INV negative-control sabotage modes (spec §6.2). Test builds only.
+#[cfg(feature = "drift-injection")]
+pub mod sabotage;
+
 // Step 1: Pure math — timing conversions and beat timeline
 pub mod timing;
 pub mod beat_timeline;
