@@ -19,6 +19,18 @@
 // the single timing authority — derived integer positions, no advanced cursors.
 pub mod timeline;
 
+// Lock-free single-writer snapshot cell (spec §3.5).
+pub mod seqlock;
+
+// The two engine planes (spec §3.3). Audio core renders inside the OS audio
+// callback; control plane validates/prepares on the caller's thread. Both
+// need the native Signalsmith stretcher; the WASM build (M4) compiles the
+// same C++ in via Emscripten and lifts this gate.
+#[cfg(feature = "native-stretch")]
+pub mod audio_core;
+#[cfg(feature = "native-stretch")]
+pub mod control_plane;
+
 // T-INV negative-control sabotage modes (spec §6.2). Test builds only.
 #[cfg(feature = "drift-injection")]
 pub mod sabotage;

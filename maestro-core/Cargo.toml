@@ -18,6 +18,9 @@ signalsmith-stretch = { version = "0.1", optional = true }
 # Lock-free SPSC queues for the RT command/event/reclaim paths (spec §3.3).
 rtrb = "0.3"
 
+# The one API schema (spec §3.6): Command / Event / Snapshot / Config.
+maestro-api = { path = "../maestro-api" }
+
 # Step 9: WASM exports via wasm-bindgen
 # Feature-gated: only compiled for wasm32 targets
 wasm-bindgen = { version = "0.2", optional = true }

@@ -379,6 +379,33 @@ impl Stretcher {
         Ok(())
     }
 
+    /// Preallocate the internal interleaved scratch buffers so that no later
+    /// call (`seek`, `process_separated`) allocates. The render path must be
+    /// allocation-free (spec §3.3 RT rules); the control plane calls this at
+    /// track-install time, before the stretcher crosses to the audio thread.
+    pub fn preallocate(&mut self, max_input_frames: usize, max_output_frames: usize) {
+        let ch = self.channels as usize;
+        self.interleaved_in.reserve(max_input_frames * ch);
+        self.interleaved_out.reserve(max_output_frames * ch);
+    }
+
+    /// Seek (pre-roll) the stretcher from an already-interleaved window.
+    ///
+    /// RT-safe variant of [`Self::seek`] for the anchor procedure (spec §3.2):
+    /// no staging copy, no allocation. `input.len()` must be a multiple of the
+    /// channel count.
+    pub fn seek_interleaved(&mut self, input: &[f32], playback_rate: f64) -> Result<(), StretchError> {
+        let ch = self.channels as usize;
+        if !input.len().is_multiple_of(ch) {
+            return Err(StretchError::ChannelMismatch { expected: ch, got: 0 });
+        }
+        if input.is_empty() {
+            return Ok(());
+        }
+        self.inner.seek(input, playback_rate);
+        Ok(())
+    }
+
     /// Seek (pre-roll) the stretcher to prime internal buffers.
     ///
     /// Call this before the first `process()` after a position change or

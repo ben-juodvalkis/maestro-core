@@ -22,26 +22,28 @@
 //! variants; adding an operation = one enum variant + one match arm.
 
 use serde::{Deserialize, Serialize};
-use ts_rs::TS;
 
 /// Engine configuration passed to `init`. The engine sample rate is fixed at
 /// 48 kHz by design (spec §4.7); `sample_rate` exists so the shim's assertion
 /// is explicit, not implicit.
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[ts(export)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 pub struct EngineConfig {
     /// Must be 48_000. `init` fails on anything else — the engine never resamples.
     pub sample_rate: u32,
     /// Initial engine tempo in milli-BPM (e.g. 120 BPM = 120_000).
     pub initial_tempo_mbpm: u32,
+    /// Beats per bar from the song's time-signature metadata. The engine never
+    /// hardcodes 4/4 (spec §4.12); bar display derives from this.
+    pub beats_per_bar: u32,
 }
 
 /// Commands accepted by `dispatch`. Applied by the audio thread at the next
 /// block boundary; nothing timing-critical crosses the bridge (spec §3.5).
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
-#[ts(export)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 pub enum Command {
     /// Start the transport. The master frame clock `F` advances only while playing.
     Play,
@@ -63,9 +65,9 @@ pub enum Command {
 }
 
 /// Result of `dispatch`, returned as JSON.
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
-#[ts(export)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 pub enum CommandResult {
     Ok,
     Rejected { reason: String },
@@ -73,9 +75,9 @@ pub enum CommandResult {
 
 /// Per-file PCM metadata handed to `load_pcm` (spec §3.4). Lengths are
 /// reconciled in Rust, decoder-agnostically; mismatch is a hard load failure.
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[ts(export)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 pub struct LoadMeta {
     /// Stable slot index (0..MAX_TRACKS) chosen by the backend.
     pub slot: u8,
@@ -95,9 +97,9 @@ pub struct LoadMeta {
 
 /// Edge-triggered events drained via `drain_events_json`. JS state is cosmetic;
 /// a missed event can never desync anything (spec §3.5).
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
-#[ts(export)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 pub enum Event {
     TrackLoaded { slot: u8, reconciliation: String },
     TrackLoadFailed { slot: u8, reason: String },
@@ -108,17 +110,17 @@ pub enum Event {
     BudgetExceeded { render_ns: u64, period_ns: u64 },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[ts(export)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 pub enum TransportState {
     Stopped,
     Playing,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[ts(export)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 pub enum TrackStatus {
     Empty,
     Loaded,
@@ -127,9 +129,9 @@ pub enum TrackStatus {
 
 /// Per-track slice of the snapshot. Track identity across the bridge is the
 /// slot index; the backend owns the trackId ↔ slot map (spec §3.5).
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[ts(export)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 pub struct TrackSnap {
     pub slot: u8,
     pub status: TrackStatus,
@@ -144,9 +146,9 @@ pub struct TrackSnap {
 
 /// The only state egress (spec §3.5): written by the audio thread once per
 /// block behind a seqlock, serialized on demand by the control plane.
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[ts(export)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 pub struct Snapshot {
     pub engine_frame: u64,
     pub tempo_mbpm: u32,
@@ -156,9 +158,14 @@ pub struct Snapshot {
     pub beat_in_bar: f32,
     pub timeline_epoch: u32,
     /// Render-budget telemetry (spec §3.3): the audio thread times itself.
+    /// The C0 gate "p99 < 50% of period" is exactly
+    /// `blocks_over_half_period / blocks_total ≤ 0.01`; "max < 90%" uses
+    /// `render_ns_max` against `callback_period_ns`. `underruns` counts blocks
+    /// whose render exceeded the full callback period.
     pub underruns: u32,
     pub render_ns_max: u64,
-    pub render_ns_p99: u64,
     pub callback_period_ns: u64,
+    pub blocks_total: u64,
+    pub blocks_over_half_period: u64,
     pub tracks: Vec<TrackSnap>,
 }

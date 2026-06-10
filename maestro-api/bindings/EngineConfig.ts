@@ -13,4 +13,9 @@ sampleRate: number,
 /**
  * Initial engine tempo in milli-BPM (e.g. 120 BPM = 120_000).
  */
-initialTempoMbpm: number, };
+initialTempoMbpm: number, 
+/**
+ * Beats per bar from the song's time-signature metadata. The engine never
+ * hardcodes 4/4 (spec §4.12); bar display derives from this.
+ */
+beatsPerBar: number, };

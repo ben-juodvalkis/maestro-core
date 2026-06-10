@@ -1,0 +1,11 @@
+# RT rules enforcement (native-audio-rebuild spec §3.3): no locks anywhere in
+# the engine crates. The audio core runs inside the OS audio callback; the
+# control plane talks to it only through lock-free SPSC queues and a seqlock.
+# If an FFI boundary site genuinely needs a lock (e.g. UniFFI object wrapper),
+# annotate it with #[allow(clippy::disallowed_types)] and a justification —
+# the exception must be visible in review, never the default.
+disallowed-types = [
+    { path = "std::sync::Mutex", reason = "no locks in the engine (spec §3.3 RT rules); see clippy.toml" },
+    { path = "std::sync::RwLock", reason = "no locks in the engine (spec §3.3 RT rules); see clippy.toml" },
+    { path = "std::sync::Condvar", reason = "no locks in the engine (spec §3.3 RT rules); see clippy.toml" },
+]

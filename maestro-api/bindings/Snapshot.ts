@@ -13,5 +13,9 @@ export type Snapshot = { engineFrame: bigint, tempoMbpm: number, transport: Tran
 bar: number, beatInBar: number, timelineEpoch: number, 
 /**
  * Render-budget telemetry (spec §3.3): the audio thread times itself.
+ * The C0 gate "p99 < 50% of period" is exactly
+ * `blocks_over_half_period / blocks_total ≤ 0.01`; "max < 90%" uses
+ * `render_ns_max` against `callback_period_ns`. `underruns` counts blocks
+ * whose render exceeded the full callback period.
  */
-underruns: number, renderNsMax: bigint, renderNsP99: bigint, callbackPeriodNs: bigint, tracks: Array<TrackSnap>, };
+underruns: number, renderNsMax: bigint, callbackPeriodNs: bigint, blocksTotal: bigint, blocksOverHalfPeriod: bigint, tracks: Array<TrackSnap>, };

@@ -329,12 +329,6 @@ impl TrackTimeline {
     /// accumulated (positions are derived; the clamp affects audio only).
     #[inline]
     pub fn pcm_index(&self, n: u64) -> u64 {
-        #[cfg(feature = "drift-injection")]
-        if crate::sabotage::mode() == crate::sabotage::Sabotage::PcmLengthLoop {
-            // Negative control (spec §6.2): wrap at integer PCM length — the
-            // abandoned branch's D2 defect. T-INV must detect this.
-            return n % self.pcm_len;
-        }
         let w = self.wrap_of_sample(n);
         let idx = n - self.wrap_start_sample(w);
         idx.min(self.pcm_len - 1)

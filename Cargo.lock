@@ -321,6 +321,7 @@ version = "0.1.0"
 dependencies = [
  "assert_no_alloc",
  "js-sys",
+ "maestro-api",
  "num-bigint",
  "rtrb",
  "serde",

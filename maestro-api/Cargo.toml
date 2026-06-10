@@ -8,8 +8,14 @@ license = "MIT"
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-ts-rs = { version = "10", features = ["serde-compat"] }
+# Only pulled in for binding generation (`--features ts`); engine builds stay lean.
+ts-rs = { version = "10", features = ["serde-compat"], optional = true }
+
+[features]
+default = []
+ts = ["dep:ts-rs"]
 
 [[bin]]
 name = "gen-ts"
 path = "src/bin/gen_ts.rs"
+required-features = ["ts"]
