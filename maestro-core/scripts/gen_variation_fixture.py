@@ -74,20 +74,39 @@ def write_wav(path: str, left: list, right: list) -> None:
         f.write(out)
 
 
-def main() -> None:
-    here = os.path.dirname(os.path.abspath(__file__))
-    repo = os.path.dirname(os.path.dirname(here))
-    src = os.path.join(repo, "maestro-core/tests/fixtures/metronome_60.wav")
-    left, right = read_float_wav(src)
-    assert len(left) == TOTAL, f"unexpected fixture length {len(left)}"
-
-    for b in range(BEATS):
-        start = b * BEAT_FRAMES + BURST_DELAY
+def add_bursts(left: list, right: list, beats: int, beat_frames: int) -> None:
+    for b in range(beats):
+        start = b * beat_frames + BURST_DELAY
         for k in range(BURST_LEN):
             t = k / SR
             s = BURST_PEAK * math.sin(2 * math.pi * BURST_HZ * t) * math.exp(-t / BURST_DECAY_S)
             left[start + k] += s
             right[start + k] += s
+
+
+def main() -> None:
+    here = os.path.dirname(os.path.abspath(__file__))
+    repo = os.path.dirname(os.path.dirname(here))
+
+    # Parameterized mode (M3, the Metronome Test library song):
+    #   gen_variation_fixture.py <source.wav> <bpm> <out.wav>
+    # Same burst recipe, any metronome fixture; identity asserted from bpm.
+    import sys
+    if len(sys.argv) == 4:
+        src, bpm, out = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+        beat_frames = SR * 60 // bpm
+        left, right = read_float_wav(src)
+        assert len(left) % beat_frames == 0, f"{src}: {len(left)} frames not whole beats at {bpm} BPM"
+        add_bursts(left, right, len(left) // beat_frames, beat_frames)
+        write_wav(out, left, right)
+        print(f"wrote {out} ({len(left)} frames)")
+        return
+
+    src = os.path.join(repo, "maestro-core/tests/fixtures/metronome_60.wav")
+    left, right = read_float_wav(src)
+    assert len(left) == TOTAL, f"unexpected fixture length {len(left)}"
+
+    add_bursts(left, right, BEATS, BEAT_FRAMES)
 
     for rel in (
         "maestro-core/tests/fixtures/metronome_60_var.wav",

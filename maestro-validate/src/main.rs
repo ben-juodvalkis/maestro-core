@@ -176,6 +176,12 @@ fn median(v: &[i64]) -> i64 {
 struct CommandLog {
     /// (start_frame, mbpm), starting with (0, initial tempo).
     segments: Vec<(u64, u64)>,
+    /// Slot-1 first activation frame (timing scenario). The harness arms
+    /// before Play so this is 0 there; a REAL-UI run (checkpoint C3) arms
+    /// stem B by a human tap mid-transport, so B's predicted grid starts at
+    /// the engine's own activation echo — §6.4's predicted-vs-measured rule,
+    /// now grounded for both drivers. Not a threshold change (ADR-093).
+    b_start: Option<u64>,
     /// Slot-1 deactivation / post-stop reactivation frames (timing scenario).
     b_stop: Option<u64>,
     b_restart: Option<u64>,
@@ -203,6 +209,7 @@ fn parse_command_log(report: &serde_json::Value, initial_tempo: u64) -> Result<C
         .ok_or("finalSnapshot.engineFrame missing")?;
     let mut log = CommandLog {
         segments: vec![(0, initial_tempo)],
+        b_start: None,
         b_stop: None,
         b_restart: None,
         variation_at: None,
@@ -233,12 +240,13 @@ fn parse_command_log(report: &serde_json::Value, initial_tempo: u64) -> Result<C
             }
             "trackDeactivated" if slot == Some(1) => log.b_stop = at,
             "trackActivated" if slot == Some(1) => {
-                // The initial arm echoes at frame 0; the restart is the one
-                // after the stop.
-                if let (Some(at), Some(stop)) = (at, log.b_stop) {
-                    if at >= stop {
-                        log.b_restart = Some(at);
-                    }
+                // First activation starts B's grid (harness: frame 0; real
+                // UI: the human's tap, echoed exactly); the restart is the
+                // first activation after the stop.
+                match (at, log.b_stop) {
+                    (Some(at), Some(stop)) if at >= stop => log.b_restart = Some(at),
+                    (Some(at), None) if log.b_start.is_none() => log.b_start = Some(at),
+                    _ => {}
                 }
             }
             "variationApplied" => log.variation_at = at,
@@ -871,8 +879,12 @@ fn analyze_timing(
         ),
     );
 
-    // ---- Stem B (R): silent window [b_stop, b_restart). --------------------
-    let b_grid_pre: Vec<u64> = grid.iter().copied().filter(|&g| g < b_stop).collect();
+    // ---- Stem B (R): active [b_start, b_stop), silent [b_stop, b_restart). --
+    // b_start is 0 for harness runs (armed before Play); for real-UI runs
+    // (C3) it is the engine's echo of the human's arm tap.
+    let b_start = log.b_start.unwrap_or(0);
+    let b_grid_pre: Vec<u64> =
+        grid.iter().copied().filter(|&g| g >= b_start && g < b_stop).collect();
     let b_grid_post: Vec<u64> = grid.iter().copied().filter(|&g| g >= b_restart).collect();
 
     // Split detected onsets at the middle of the silent window (in capture

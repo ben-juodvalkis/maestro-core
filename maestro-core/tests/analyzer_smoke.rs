@@ -87,8 +87,22 @@ fn render_scenario(stems: &[Stem], out_name: &str) {
     println!("wrote {}", path.display());
 }
 
+
+/// The sabotage mode is process-global (`maestro_core::sabotage`), so the
+/// capture-writing tests must not run concurrently: a clean render racing a
+/// sabotaged one inherits its mode and the clean capture fails analysis
+/// (observed as an order-dependent flake at M3). Every test in this file
+/// takes this lock first; a poisoned lock is fine (the panicking test
+/// already failed the suite).
+static RENDER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn render_serial() -> std::sync::MutexGuard<'static, ()> {
+    RENDER_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[test]
 fn write_unity_capture() {
+    let _serial = render_serial();
     render_scenario(
         &[
             Stem { fixture: "metronome_120.wav", o_mbpm: 120_000, pan: -1.0 },
@@ -100,6 +114,7 @@ fn write_unity_capture() {
 
 #[test]
 fn write_cross_capture() {
+    let _serial = render_serial();
     render_scenario(
         &[
             Stem { fixture: "metronome_60.wav", o_mbpm: 60_000, pan: -1.0 },
@@ -114,6 +129,7 @@ fn write_cross_capture() {
 #[cfg(feature = "drift-injection")]
 #[test]
 fn write_cross_stretch_disabled_capture() {
+    let _serial = render_serial();
     maestro_core::sabotage::set_mode(maestro_core::sabotage::Sabotage::StretchDisabled);
     render_scenario(
         &[
@@ -263,6 +279,7 @@ fn render_timing_scenario(out_name: &str, report_name: &str) {
 
 #[test]
 fn write_timing_capture() {
+    let _serial = render_serial();
     render_timing_scenario("timing.wav", "timing_report.json");
 }
 
@@ -273,6 +290,7 @@ fn write_timing_capture() {
 #[cfg(feature = "drift-injection")]
 #[test]
 fn write_timing_stale_reanchor_capture() {
+    let _serial = render_serial();
     maestro_core::sabotage::set_mode(maestro_core::sabotage::Sabotage::StaleReanchor);
     render_timing_scenario("timing_stale_reanchor.wav", "timing_stale_reanchor_report.json");
     maestro_core::sabotage::set_mode(maestro_core::sabotage::Sabotage::None);
@@ -444,6 +462,7 @@ fn render_control_scenario(out_name: &str, report_name: &str) {
 
 #[test]
 fn write_control_capture() {
+    let _serial = render_serial();
     render_control_scenario("control.wav", "control_report.json");
 }
 
@@ -453,6 +472,7 @@ fn write_control_capture() {
 #[cfg(feature = "drift-injection")]
 #[test]
 fn write_control_stale_reanchor_capture() {
+    let _serial = render_serial();
     maestro_core::sabotage::set_mode(maestro_core::sabotage::Sabotage::StaleReanchor);
     render_control_scenario("control_stale_reanchor.wav", "control_stale_reanchor_report.json");
     maestro_core::sabotage::set_mode(maestro_core::sabotage::Sabotage::None);
