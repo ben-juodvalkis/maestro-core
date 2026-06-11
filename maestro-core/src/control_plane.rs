@@ -5,7 +5,8 @@
 //! preconfigures every resource the audio thread will touch (PCM buffers,
 //! stretchers, scratch), then transfers them across the SPSC command queue.
 //! It also drains the event and reclaim queues — the audio thread never frees
-//! memory.
+//! memory — and owns the §4.11 variation PCM cache (per-song budget, eviction
+//! of the least-recently-audible variation, async switch bookkeeping).
 //!
 //! State egress is exactly one call: [`ControlPlane::snapshot`] reads the
 //! seqlock'd POD the audio thread publishes each block and converts it to the
@@ -13,7 +14,10 @@
 
 use std::sync::Arc;
 
-use maestro_api::{Command, CommandResult, EngineConfig, Event, LoadMeta, Snapshot, TrackSnap, TrackStatus, TransportState};
+use maestro_api::{
+    Command, CommandResult, EngineConfig, Event, LoadMeta, Snapshot, TrackSnap, TrackStatus,
+    TransportPolicy, TransportState,
+};
 
 use crate::audio_core::{AudioCore, RawSnapshot, Reclaimable, RtCommand, RtEvent, MAX_TRACKS};
 use crate::pcm_cache::PcmData;
@@ -26,6 +30,11 @@ use crate::timeline::{Timeline, TrackTimeline, ENGINE_SAMPLE_RATE, MAX_TEMPO_MBP
 const COMMAND_QUEUE_CAPACITY: usize = 256;
 const EVENT_QUEUE_CAPACITY: usize = 256;
 const RECLAIM_QUEUE_CAPACITY: usize = 256;
+
+/// §4.11 per-song PCM budget: installed + cached variation PCM for one engine
+/// instance must stay under this; above it, the least-recently-audible cached
+/// (never an installed/audible) variation is evicted.
+pub const PCM_BUDGET_BYTES: u64 = 96 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EngineError {
@@ -47,7 +56,9 @@ impl std::fmt::Display for EngineError {
 impl std::error::Error for EngineError {}
 
 /// Which §3.4 reconciliation case fired for a loaded file. Reported in the
-/// load event and asserted stable across variations of a stem (M2).
+/// load event and asserted stable across variations of a stem (spec §3.4#4):
+/// same decoder + same encoder must reconcile the same way — a flip means a
+/// mis-tagged or mis-decoded file, which is a hard failure, not a curiosity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reconciliation {
     /// Decoded length == original_samples: decoder already applied gapless trim.
@@ -74,20 +85,37 @@ const MAX_RATE_DEN: u64 = 4; // rate ≥ 0.25 ⇔  4·E ≥ O
 /// §4.8 pitch clamp: ±12 semitones; out-of-range commands are rejected.
 const MAX_PITCH_SEMITONES: f32 = 12.0;
 
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+/// Gain accepted range (ADR-092): [0, 2] (unity + headroom); rejected outside.
+const MAX_GAIN: f32 = 2.0;
+
+/// Control-side mirror of an installed track: immutable musical identity (for
+/// variation-switch and §4.8 validation), the installed PCM, and the §4.11
+/// variation cache for this slot.
+struct LoadedSlot {
+    o_mbpm: u32,
+    loop_beats: u32,
+    original_samples: u64,
+    variation: u8,
+    /// §3.4#4: which reconciliation case fired for the first loaded file of
+    /// this stem; later variations must match.
+    reconciliation: Reconciliation,
+    /// The PCM currently installed in the audio core (Arc-shared with it).
+    current_pcm: Arc<PcmData>,
+    /// Cached non-current variations: (variation, pcm, last-audible stamp).
+    /// Stamped when the variation stops being current (or at load if never
+    /// current) — the §4.11 eviction order.
+    cached: Vec<(u8, Arc<PcmData>, u64)>,
+    /// §4.11 async switch: a requested variation awaiting platform load.
+    pending_variation: Option<u8>,
+}
+
 enum SlotState {
-    #[default]
     Empty,
-    /// Control-side mirror of the installed track's immutable musical
-    /// identity, used to validate variation switches (spec §3.4: all
-    /// variations of a stem must declare identical identity) and tempo
-    /// commands (§4.8 rate clamp).
-    Loaded {
-        o_mbpm: u32,
-        loop_beats: u32,
-        original_samples: u64,
-        variation: u8,
-    },
+    Loaded(Box<LoadedSlot>),
+}
+
+fn pcm_bytes(p: &PcmData) -> u64 {
+    p.length_samples * p.num_channels as u64 * 4
 }
 
 /// The control-plane handle. One per engine instance; not `Sync` — the FFI
@@ -102,10 +130,15 @@ pub struct ControlPlane {
     /// rate validation. The snapshot lags by a block; this mirror is always
     /// consistent with the command stream this plane has issued.
     tempo_mbpm: u32,
-    /// Control-side mirror for validation only (is the slot loaded?); the
-    /// authoritative runtime state is the audio core's.
+    /// Control-side mirrors; the authoritative runtime state is the audio
+    /// core's. Owns the §4.11 variation caches.
     slots: [SlotState; MAX_TRACKS],
-    /// Events originated control-side (loads), merged into `drain_events`.
+    /// Monotonic stamp source for the §4.11 least-recently-audible order.
+    lru_clock: u64,
+    /// RT event-queue drops already surfaced (spec §6.7).
+    events_dropped_seen: u32,
+    /// Events originated control-side (loads, eviction, overflow), merged
+    /// into `drain_events`.
     pending_events: Vec<Event>,
 }
 
@@ -117,6 +150,21 @@ fn rate_in_range(tempo_mbpm: u32, o_mbpm: u32, slot: usize) -> Result<(), String
             "tempo {tempo_mbpm} mBPM puts slot {slot} (original {o_mbpm} mBPM) outside the \
              rate clamp [0.25, 4.0] (spec §4.8)"
         ));
+    }
+    Ok(())
+}
+
+/// Gain/pan validation (rejected, never clamped — project principle).
+fn validate_gain(gain: f32) -> Result<(), String> {
+    if !gain.is_finite() || !(0.0..=MAX_GAIN).contains(&gain) {
+        return Err(format!("gain {gain} outside [0, {MAX_GAIN}] (ADR-092)"));
+    }
+    Ok(())
+}
+
+fn validate_pan(pan: f32) -> Result<(), String> {
+    if !pan.is_finite() || !(-1.0..=1.0).contains(&pan) {
+        return Err(format!("pan {pan} outside [-1, 1]"));
     }
     Ok(())
 }
@@ -154,7 +202,9 @@ pub fn create_engine(config: EngineConfig) -> Result<(ControlPlane, Box<AudioCor
         snapshot,
         tempo_mbpm: config.initial_tempo_mbpm,
         config,
-        slots: [SlotState::default(); MAX_TRACKS],
+        slots: std::array::from_fn(|_| SlotState::Empty),
+        lru_clock: 0,
+        events_dropped_seen: 0,
         pending_events: Vec::new(),
     };
     Ok((plane, core))
@@ -178,8 +228,8 @@ impl ControlPlane {
                 // Live tempo changes are M1 surface — applied at the next
                 // block boundary; the engine echoes Event::TempoApplied.
                 for (slot, s) in self.slots.iter().enumerate() {
-                    if let SlotState::Loaded { o_mbpm, .. } = s {
-                        if let Err(reason) = rate_in_range(*mbpm, *o_mbpm, slot) {
+                    if let SlotState::Loaded(l) = s {
+                        if let Err(reason) = rate_in_range(*mbpm, l.o_mbpm, slot) {
                             return CommandResult::Rejected { reason };
                         }
                     }
@@ -191,24 +241,63 @@ impl ControlPlane {
             Command::Stop => self.send(RtCommand::Stop),
             Command::Pause => self.send(RtCommand::Pause),
             Command::Resume => self.send(RtCommand::Resume),
-            Command::Activate { slot, quantize } => {
+            Command::Activate { slot, quantize, transport } => {
                 if let Err(r) = self.expect_loaded(*slot) {
                     return r;
                 }
-                self.send(RtCommand::Activate { slot: *slot, quantize: *quantize });
+                self.send(RtCommand::Activate {
+                    slot: *slot,
+                    quantize: *quantize,
+                    auto_start: *transport == TransportPolicy::Auto,
+                });
             }
-            Command::Deactivate { slot } => {
+            Command::Deactivate { slot, transport } => {
                 if let Err(r) = self.expect_loaded(*slot) {
                     return r;
                 }
-                self.send(RtCommand::Deactivate { slot: *slot });
+                self.send(RtCommand::Deactivate {
+                    slot: *slot,
+                    auto_stop: *transport == TransportPolicy::Auto,
+                });
             }
             Command::RemoveTrack { slot } => {
                 if let Err(r) = self.expect_loaded(*slot) {
                     return r;
                 }
+                // Frees the slot mirror AND its §4.11 variation cache; the
+                // audio core hands its TrackState back via the reclaim queue.
                 self.slots[*slot as usize] = SlotState::Empty;
                 self.send(RtCommand::RemoveTrack { slot: *slot });
+            }
+            Command::SetGain { slot, gain } => {
+                if let Err(r) = self.expect_loaded(*slot) {
+                    return r;
+                }
+                if let Err(reason) = validate_gain(*gain) {
+                    return CommandResult::Rejected { reason };
+                }
+                self.send(RtCommand::SetGain { slot: *slot, gain: *gain });
+            }
+            Command::SetPan { slot, pan } => {
+                if let Err(r) = self.expect_loaded(*slot) {
+                    return r;
+                }
+                if let Err(reason) = validate_pan(*pan) {
+                    return CommandResult::Rejected { reason };
+                }
+                self.send(RtCommand::SetPan { slot: *slot, pan: *pan });
+            }
+            Command::SetMute { slot, muted } => {
+                if let Err(r) = self.expect_loaded(*slot) {
+                    return r;
+                }
+                self.send(RtCommand::SetMute { slot: *slot, muted: *muted });
+            }
+            Command::SetSolo { slot, solo } => {
+                if let Err(r) = self.expect_loaded(*slot) {
+                    return r;
+                }
+                self.send(RtCommand::SetSolo { slot: *slot, solo: *solo });
             }
             Command::SetPitch { slot, semitones } => {
                 if let Err(r) = self.expect_loaded(*slot) {
@@ -224,23 +313,100 @@ impl ControlPlane {
                 }
                 self.send(RtCommand::SetPitch { slot: *slot, semitones: *semitones });
             }
+            Command::SwitchVariation { slot, variation } => {
+                return self.switch_variation(*slot, *variation);
+            }
         }
         CommandResult::Ok
+    }
+
+    /// §4.11 variation switch. Cached → swap at the next block boundary;
+    /// not cached → acknowledged, `VariationLoadRequired` asks the platform
+    /// to decode + `load_pcm`, and the swap applies on load completion.
+    fn switch_variation(&mut self, slot: u8, variation: u8) -> CommandResult {
+        if let Err(r) = self.expect_loaded(slot) {
+            return r;
+        }
+        let SlotState::Loaded(l) = &mut self.slots[slot as usize] else { unreachable!() };
+        if l.variation == variation {
+            l.pending_variation = None;
+            return CommandResult::Ok; // already current — no-op
+        }
+        if let Some(idx) = l.cached.iter().position(|(v, _, _)| *v == variation) {
+            let (_, pcm, _) = l.cached.swap_remove(idx);
+            let outgoing = (l.variation, Arc::clone(&l.current_pcm));
+            l.current_pcm = Arc::clone(&pcm);
+            l.variation = variation;
+            l.pending_variation = None;
+            self.lru_clock += 1;
+            let stamp = self.lru_clock;
+            let SlotState::Loaded(l) = &mut self.slots[slot as usize] else { unreachable!() };
+            l.cached.push((outgoing.0, outgoing.1, stamp));
+            self.send(RtCommand::SwapVariation { slot, variation, pcm });
+            self.enforce_pcm_budget();
+        } else {
+            l.pending_variation = Some(variation);
+            self.pending_events.push(Event::VariationLoadRequired { slot, variation });
+        }
+        CommandResult::Ok
+    }
+
+    /// §4.11 eviction: above the per-song budget, drop the least-recently-
+    /// audible CACHED variation (installed/audible ones are never evicted).
+    fn enforce_pcm_budget(&mut self) {
+        loop {
+            if self.pcm_bytes_in_use() <= PCM_BUDGET_BYTES {
+                return;
+            }
+            // Globally oldest cached entry across all slots.
+            let mut oldest: Option<(usize, usize, u64)> = None;
+            for (s, state) in self.slots.iter().enumerate() {
+                if let SlotState::Loaded(l) = state {
+                    for (i, (_, _, stamp)) in l.cached.iter().enumerate() {
+                        if oldest.is_none_or(|(_, _, best)| *stamp < best) {
+                            oldest = Some((s, i, *stamp));
+                        }
+                    }
+                }
+            }
+            let Some((s, i, _)) = oldest else { return }; // nothing evictable
+            let SlotState::Loaded(l) = &mut self.slots[s] else { unreachable!() };
+            let (variation, _pcm, _) = l.cached.swap_remove(i);
+            self.pending_events.push(Event::VariationEvicted { slot: s as u8, variation });
+        }
+    }
+
+    /// PCM bytes resident in this engine instance (installed + cached) —
+    /// reported in the snapshot; the §4.11 budget gate reads it.
+    pub fn pcm_bytes_in_use(&self) -> u64 {
+        self.slots
+            .iter()
+            .map(|s| match s {
+                SlotState::Loaded(l) => {
+                    pcm_bytes(&l.current_pcm)
+                        + l.cached.iter().map(|(_, p, _)| pcm_bytes(p)).sum::<u64>()
+                }
+                SlotState::Empty => 0,
+            })
+            .sum()
     }
 
     /// The one bulk-data call (spec §3.6). Performs §3.4 length reconciliation
     /// and loop-identity validation; on success installs the track at its slot.
     ///
     /// `left`/`right` are the decoded PCM channels at 48 kHz. The platform shim
-    /// guarantees no resampling and no channel conversion happened (spec §3.4#3);
-    /// this function guarantees the length is exactly consistent with the
-    /// stem's musical identity, or the load fails loudly.
+    /// guarantees no resampling and no channel conversion happened (spec §3.4#3)
+    /// and reports the decoded rate in `meta.sample_rate` (re-validated here —
+    /// defense in depth, §4.12); this function guarantees the length is exactly
+    /// consistent with the stem's musical identity, or the load fails loudly.
     pub fn load_pcm(&mut self, meta: &LoadMeta, left: Vec<f32>, right: Vec<f32>) -> Result<Reconciliation, String> {
         let slot = meta.slot;
+        let variation = meta.variation;
         let result = self.load_pcm_inner(meta, left, right);
         match &result {
             Ok(rec) => self.pending_events.push(Event::TrackLoaded {
                 slot,
+                variation,
                 reconciliation: rec.as_str().to_string(),
             }),
             Err(reason) => self
@@ -254,9 +420,20 @@ impl ControlPlane {
         if meta.slot as usize >= MAX_TRACKS {
             return Err(format!("slot {} out of range (MAX_TRACKS = {MAX_TRACKS})", meta.slot));
         }
+        // §3.4#3 / §4.7: the engine never resamples; the shim must hand us
+        // 48 kHz exactly. Hard failure, no fallback.
+        if meta.sample_rate != ENGINE_SAMPLE_RATE {
+            return Err(format!(
+                "sample rate {} != {ENGINE_SAMPLE_RATE} — the engine never resamples; \
+                 load fails (spec §3.4)",
+                meta.sample_rate
+            ));
+        }
         if left.len() != right.len() {
             return Err(format!("channel length mismatch: L={} R={}", left.len(), right.len()));
         }
+        validate_gain(meta.gain)?;
+        validate_pan(meta.pan)?;
         let l_dec = left.len() as u64;
 
         // §3.4#4 decoder-agnostic length reconciliation — the double-trim killer.
@@ -297,41 +474,61 @@ impl ControlPlane {
 
         // Variation switch (spec §3.2): loading a different variation into an
         // occupied slot swaps the PCM engine-side (Arc swap + re-anchor +
-        // one-block crossfade at a block boundary). All variations of a stem
-        // must declare identical musical identity (spec §3.4) — anything else
-        // is a hard failure, because loop length can never change underneath
-        // the timeline (kills D9/D10).
-        if let SlotState::Loaded { o_mbpm, loop_beats, original_samples, variation } =
-            self.slots[meta.slot as usize]
-        {
-            if variation != meta.variation {
-                if o_mbpm != meta.original_tempo_mbpm
-                    || loop_beats != meta.loop_beats
-                    || original_samples != meta.original_samples
+        // one-block crossfade at a block boundary) — also the completion path
+        // of an async SwitchVariation (§4.11). All variations of a stem must
+        // declare identical musical identity AND reconcile the same way
+        // (spec §3.4) — anything else is a hard failure, because loop length
+        // can never change underneath the timeline (kills D9/D10).
+        if let SlotState::Loaded(l) = &self.slots[meta.slot as usize] {
+            if l.variation != meta.variation {
+                if l.o_mbpm != meta.original_tempo_mbpm
+                    || l.loop_beats != meta.loop_beats
+                    || l.original_samples != meta.original_samples
                 {
                     return Err(format!(
                         "variation {} identity mismatch on slot {}: installed \
-                         (O={o_mbpm}, loop_beats={loop_beats}, original_samples={original_samples}) \
+                         (O={}, loop_beats={}, original_samples={}) \
                          vs incoming (O={}, loop_beats={}, original_samples={}) — all variations \
                          of a stem must be musically identical (spec §3.4)",
                         meta.variation,
                         meta.slot,
+                        l.o_mbpm,
+                        l.loop_beats,
+                        l.original_samples,
                         meta.original_tempo_mbpm,
                         meta.loop_beats,
                         meta.original_samples,
                     ));
+                }
+                if l.reconciliation != reconciliation {
+                    return Err(format!(
+                        "variation {} of slot {} reconciled as {:?} but the installed stem \
+                         reconciled as {:?} — reconciliation must be stable across variations \
+                         (spec §3.4#4); the file is mis-tagged or mis-decoded",
+                        meta.variation, meta.slot, reconciliation, l.reconciliation,
+                    ));
+                }
+                self.lru_clock += 1;
+                let stamp = self.lru_clock;
+                let SlotState::Loaded(l) = &mut self.slots[meta.slot as usize] else {
+                    unreachable!()
+                };
+                // The outgoing current variation goes to the §4.11 cache; a
+                // re-load of an already-cached variation replaces the entry.
+                let outgoing = (l.variation, Arc::clone(&l.current_pcm), stamp);
+                l.cached.retain(|(v, _, _)| *v != outgoing.0 && *v != meta.variation);
+                l.cached.push(outgoing);
+                l.current_pcm = Arc::clone(&pcm);
+                l.variation = meta.variation;
+                if l.pending_variation == Some(meta.variation) {
+                    l.pending_variation = None;
                 }
                 self.send(RtCommand::SwapVariation {
                     slot: meta.slot,
                     variation: meta.variation,
                     pcm,
                 });
-                self.slots[meta.slot as usize] = SlotState::Loaded {
-                    o_mbpm,
-                    loop_beats,
-                    original_samples,
-                    variation: meta.variation,
-                };
+                self.enforce_pcm_budget();
                 return Ok(reconciliation);
             }
         }
@@ -350,7 +547,7 @@ impl ControlPlane {
         let stretcher = Box::new(Stretcher::new(2, ENGINE_SAMPLE_RATE));
         let state = Box::new(crate::audio_core::TrackState::new(
             map,
-            pcm,
+            Arc::clone(&pcm),
             meta.gain,
             meta.pan,
             meta.variation,
@@ -358,12 +555,17 @@ impl ControlPlane {
         ));
 
         self.send(RtCommand::InstallTrack { slot: meta.slot, state });
-        self.slots[meta.slot as usize] = SlotState::Loaded {
+        self.slots[meta.slot as usize] = SlotState::Loaded(Box::new(LoadedSlot {
             o_mbpm: meta.original_tempo_mbpm,
             loop_beats: meta.loop_beats,
             original_samples: meta.original_samples,
             variation: meta.variation,
-        };
+            reconciliation,
+            current_pcm: pcm,
+            cached: Vec::new(),
+            pending_variation: None,
+        }));
+        self.enforce_pcm_budget();
         Ok(reconciliation)
     }
 
@@ -380,6 +582,10 @@ impl ControlPlane {
                 slot: slot as u8,
                 status: if t.active { TrackStatus::Active } else { TrackStatus::Loaded },
                 variation: t.variation,
+                gain: t.gain,
+                pan: t.pan,
+                muted: t.muted,
+                solo: t.solo,
                 loop_count: t.loop_count,
                 loop_progress: t.loop_progress,
                 rms_l: t.rms_l,
@@ -406,6 +612,8 @@ impl ControlPlane {
             callback_period_ns: raw.callback_period_ns,
             blocks_total: raw.blocks_total,
             blocks_over_half_period: raw.blocks_over_half_period,
+            events_dropped: raw.events_dropped,
+            pcm_bytes_in_use: self.pcm_bytes_in_use(),
             tracks,
         }
     }
@@ -416,6 +624,13 @@ impl ControlPlane {
         // Reclaim first: dropping here is the whole point (spec §3.3).
         while let Ok(reclaimed) = self.reclaim.pop() {
             drop(reclaimed);
+        }
+        // RT event-queue overflow is surfaced, never silent (spec §6.7).
+        let dropped_total = self.raw_snapshot().events_dropped;
+        if dropped_total > self.events_dropped_seen {
+            let dropped = dropped_total - self.events_dropped_seen;
+            self.events_dropped_seen = dropped_total;
+            self.pending_events.push(Event::EventQueueOverflow { dropped });
         }
         let mut out = std::mem::take(&mut self.pending_events);
         while let Ok(e) = self.events.pop() {
@@ -429,6 +644,13 @@ impl ControlPlane {
                 RtEvent::Deactivated { slot, at_frame } => {
                     Event::TrackDeactivated { slot, at_frame }
                 }
+                RtEvent::MuteApplied { slot, muted, at_frame } => {
+                    Event::MuteApplied { slot, muted, at_frame }
+                }
+                RtEvent::SoloApplied { slot, solo, at_frame } => {
+                    Event::SoloApplied { slot, solo, at_frame }
+                }
+                RtEvent::Removed { slot } => Event::TrackRemoved { slot },
                 RtEvent::VariationApplied { slot, variation, at_frame } => {
                     Event::VariationApplied { slot, variation, at_frame }
                 }
@@ -451,7 +673,7 @@ impl ControlPlane {
 
     fn expect_loaded(&self, slot: u8) -> Result<(), CommandResult> {
         if (slot as usize) < MAX_TRACKS
-            && matches!(self.slots[slot as usize], SlotState::Loaded { .. })
+            && matches!(self.slots[slot as usize], SlotState::Loaded(_))
         {
             Ok(())
         } else {

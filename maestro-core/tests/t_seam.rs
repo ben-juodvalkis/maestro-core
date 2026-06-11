@@ -84,6 +84,7 @@ fn render_capture_with_changes(
     plane
         .load_pcm(
             &LoadMeta {
+                sample_rate: 48_000,
                 slot: 0,
                 original_tempo_mbpm: O_MBPM,
                 loop_beats: LOOP_BEATS,
@@ -98,7 +99,7 @@ fn render_capture_with_changes(
             right,
         )
         .unwrap();
-    assert!(matches!(plane.dispatch(Command::Activate { slot: 0, quantize: maestro_api::QuantizePolicy::Immediate }), CommandResult::Ok));
+    assert!(matches!(plane.dispatch(Command::Activate { slot: 0, quantize: maestro_api::QuantizePolicy::Immediate , transport: Default::default() }), CommandResult::Ok));
     assert!(matches!(plane.dispatch(Command::Play), CommandResult::Ok));
 
     let mut capture = Vec::with_capacity(total_frames as usize);

@@ -93,6 +93,14 @@ mod thresholds {
     /// aperiodic-but-flat windows. A period must repeat at least twice
     /// inside the window to count.
     pub const ONSET_PATTERN_PERIOD_MAX: usize = 16;
+    /// VALIDATION-THRESHOLD (C2, spec §4.11): the per-song PCM budget the
+    /// memory scenario asserts against the snapshot — mirrors
+    /// `control_plane::PCM_BUDGET_BYTES`.
+    pub const MEMORY_PCM_BUDGET_BYTES: u64 = 96 * 1024 * 1024;
+    /// VALIDATION-THRESHOLD (C2): "no audio gap on the playing stems" — every
+    /// window of this length must keep an RMS floor on the sustained stem.
+    pub const GAP_WINDOW_SECONDS: f64 = 0.5;
+    pub const GAP_RMS_FLOOR: f64 = 0.003;
 }
 
 #[derive(Serialize)]
@@ -160,6 +168,17 @@ struct CommandLog {
     b_stop: Option<u64>,
     b_restart: Option<u64>,
     variation_at: Option<u64>,
+    /// C2 control scenario echoes (spec §6.4 methodology: every silent
+    /// window is predicted from these, never from wall-clock).
+    mute_on: Option<u64>,
+    mute_off: Option<u64>,
+    solo_on: Option<u64>,
+    solo_off: Option<u64>,
+    paused_at: Option<u64>,
+    resumed_at: Option<u64>,
+    /// §4.11 memory-gate echoes.
+    variation_load_required: bool,
+    variation_evicted: bool,
     /// Engine frames rendered (final snapshot).
     final_frame: u64,
 }
@@ -175,6 +194,14 @@ fn parse_command_log(report: &serde_json::Value, initial_tempo: u64) -> Result<C
         b_stop: None,
         b_restart: None,
         variation_at: None,
+        mute_on: None,
+        mute_off: None,
+        solo_on: None,
+        solo_off: None,
+        paused_at: None,
+        resumed_at: None,
+        variation_load_required: false,
+        variation_evicted: false,
         final_frame,
     };
     let events = report.get("events").and_then(|e| e.as_array()).ok_or("events missing")?;
@@ -203,6 +230,28 @@ fn parse_command_log(report: &serde_json::Value, initial_tempo: u64) -> Result<C
                 }
             }
             "variationApplied" => log.variation_at = at,
+            "variationLoadRequired" => log.variation_load_required = true,
+            "variationEvicted" => log.variation_evicted = true,
+            // Control scenario (C2): stem B (slot 1) mute pair; stem A
+            // (slot 0) solo pair silences B; pause/resume freeze F.
+            "muteApplied" if slot == Some(1) => {
+                let muted = e.get("muted").and_then(|v| v.as_bool()).unwrap_or(false);
+                if muted {
+                    log.mute_on = at;
+                } else {
+                    log.mute_off = at;
+                }
+            }
+            "soloApplied" if slot == Some(0) => {
+                let solo = e.get("solo").and_then(|v| v.as_bool()).unwrap_or(false);
+                if solo {
+                    log.solo_on = at;
+                } else {
+                    log.solo_off = at;
+                }
+            }
+            "paused" => log.paused_at = at,
+            "resumed" => log.resumed_at = at,
             _ => {}
         }
     }
@@ -380,6 +429,38 @@ fn main() -> ExitCode {
                 }
             };
             analyze_timing(&wav, &log, &mut gate, &mut report);
+        }
+        "control" => {
+            let hr = harness_json.as_ref().expect("--harness-report is required for control");
+            let log = match parse_command_log(hr, tempo_mbpm) {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!("cannot parse command log: {e}");
+                    return ExitCode::from(2);
+                }
+            };
+            analyze_control(&wav, &log, &mut gate, &mut report);
+        }
+        "interruption" => {
+            // §4.9 route-cycle leg: the outage is a common-mode splice; the
+            // cross-stem gates of the `cross` analysis are immune to it by
+            // construction — plus the anti-stub that the leg really happened.
+            analyze_offset_pairs(&wav, "cross", tempo_mbpm, harness_json.as_ref(), &mut gate, &mut report);
+            let hr = harness_json.as_ref().expect("--harness-report is required for interruption");
+            let route_changes = hr
+                .get("session")
+                .and_then(|s| s.get("routeChanges"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            gate(
+                "route-changes-happened",
+                route_changes >= 2,
+                format!("{route_changes} route changes observed (need ≥ 2: speaker→receiver→speaker)"),
+            );
+        }
+        "memory" => {
+            let hr = harness_json.as_ref().expect("--harness-report is required for memory");
+            analyze_memory(&wav, hr, tempo_mbpm, &mut gate, &mut report);
         }
         _ => {
             analyze_offset_pairs(&wav, &scenario, tempo_mbpm, harness_json.as_ref(), &mut gate, &mut report);
@@ -889,4 +970,446 @@ fn analyze_timing(
         a_slope_post: a_post.slope,
         b_slope_post: b_post.slope,
     });
+}
+
+// ---------------------------------------------------------------------------
+// C2 control analysis: the full dispatch-only flow (mute/solo/tempo/
+// variation/pause) gated against the engine's own echoes (spec §6.4)
+// ---------------------------------------------------------------------------
+
+/// Pair detected onsets against grid frames inside an engine-frame window,
+/// mapping capture positions through `align`. Returns None when the window
+/// has too few usable beats.
+struct PairedWindow {
+    window: Window,
+    expected: usize,
+    detected: usize,
+}
+
+fn pair_window(
+    onsets: &[usize],
+    grid: &[u64],
+    range: (u64, u64),
+    align: i64,
+    skip_first: usize,
+) -> Option<PairedWindow> {
+    let grid_in: Vec<u64> = grid.iter().copied().filter(|&g| g >= range.0 && g < range.1).collect();
+    let lo = range.0 as i64 + align;
+    let hi = i64::try_from(range.1).map_or(i64::MAX, |v| v.saturating_add(align));
+    let detected = onsets
+        .iter()
+        .filter(|&&o| (o as i64) >= lo && (o as i64) < hi)
+        .count();
+    let expected = grid_in.len();
+    if grid_in.len() <= skip_first + 1 {
+        return None;
+    }
+    // Pair each grid beat with the NEAREST detected onset within half the
+    // local beat spacing — immune to inclusion jitter at non-silent window
+    // boundaries (a sequential pairing shifts every pair by one beat there).
+    let mut offsets: Vec<i64> = Vec::with_capacity(grid_in.len());
+    for (i, &g) in grid_in.iter().enumerate().skip(skip_first) {
+        let spacing = if i + 1 < grid_in.len() {
+            grid_in[i + 1] - grid_in[i]
+        } else {
+            grid_in[i] - grid_in[i - 1]
+        };
+        let target = g as i64 + align;
+        let nearest = onsets
+            .iter()
+            .map(|&o| o as i64 - target)
+            .min_by_key(|d| d.abs())
+            .filter(|d| d.unsigned_abs() < spacing / 2);
+        if let Some(d) = nearest {
+            offsets.push(d);
+        }
+    }
+    if offsets.len() < 2 {
+        return None;
+    }
+    let median = median(&offsets);
+    let slope = linear_slope(&offsets);
+    let spread = offsets.iter().max().unwrap() - offsets.iter().min().unwrap();
+    Some(PairedWindow { window: Window { offsets, median, slope, spread }, expected, detected })
+}
+
+#[allow(clippy::too_many_lines)]
+fn analyze_control(
+    wav: &maestro_core::validation::LoadedWav,
+    log: &CommandLog,
+    gate: &mut impl FnMut(&str, bool, String),
+    report: &mut Report,
+) {
+    // The scripted sequence: mute B / unmute B / solo A / unsolo A / tempo
+    // change / variation switch on A / pause / resume — all echoed.
+    let need = [
+        ("muteApplied(on)", log.mute_on),
+        ("muteApplied(off)", log.mute_off),
+        ("soloApplied(on)", log.solo_on),
+        ("soloApplied(off)", log.solo_off),
+        ("paused", log.paused_at),
+        ("resumed", log.resumed_at),
+        ("variationApplied", log.variation_at),
+    ];
+    let missing: Vec<&str> =
+        need.iter().filter(|(_, v)| v.is_none()).map(|(n, _)| *n).collect();
+    gate(
+        "command-log",
+        missing.is_empty() && log.segments.len() == 2,
+        format!("echo coverage: missing {missing:?}; segments {:?}", log.segments),
+    );
+    if !missing.is_empty() || log.segments.len() != 2 {
+        return;
+    }
+    let (mute_on, mute_off) = (log.mute_on.unwrap(), log.mute_off.unwrap());
+    let (solo_on, solo_off) = (log.solo_on.unwrap(), log.solo_off.unwrap());
+    let f_pause = log.paused_at.unwrap();
+    let t_tempo = log.segments[1].0;
+    let t_var = log.variation_at.unwrap();
+    gate(
+        "sequence-order",
+        mute_on < mute_off
+            && mute_off < solo_on
+            && solo_on < solo_off
+            && solo_off < t_tempo
+            && t_tempo < t_var
+            && t_var < f_pause
+            && log.resumed_at == log.paused_at, // F frozen: same frame on both echoes
+        format!(
+            "mute [{mute_on},{mute_off}) solo [{solo_on},{solo_off}) tempo {t_tempo} \
+             variation {t_var} pause {f_pause} (resumed at {:?} must equal paused)",
+            log.resumed_at
+        ),
+    );
+
+    let grid = beat_grid(&log.segments, log.final_frame);
+    let min_gap = {
+        let min_period = log.segments.iter().map(|&(_, m)| (K / m as u128) as usize).min().unwrap();
+        min_period / 2
+    };
+    let onsets_l = detect_click_onsets(&wav.channels[0], thresholds::ONSET_THRESHOLD, min_gap);
+    let onsets_r = detect_click_onsets(&wav.channels[1], thresholds::ONSET_THRESHOLD, min_gap);
+    report.onsets_left = onsets_l.len();
+    report.onsets_right = onsets_r.len();
+    let skip = thresholds::SKIP_LEADING_ONSETS;
+
+    // ---- Stem A (L): audible throughout; the engine emits no frames while
+    // paused, so the engine-domain grid is pause-free — only the ALIGNMENT
+    // splits at the pause (capture gains wall-clock silence).
+    let n_pre_grid = grid.iter().filter(|&&g| g < f_pause).count();
+    gate(
+        "a-onset-count",
+        (onsets_l.len() as i64 - grid.len() as i64).abs() <= 2,
+        format!("stem A: {} onsets vs {} predicted beats", onsets_l.len(), grid.len()),
+    );
+    if onsets_l.len() < n_pre_grid.min(grid.len()) {
+        return;
+    }
+    // align1 from A's pre-tempo-change window.
+    let a_pre_idx: Vec<usize> = (skip..n_pre_grid.min(onsets_l.len()))
+        .filter(|&i| grid[i] < t_tempo)
+        .collect();
+    if a_pre_idx.len() < 2 {
+        gate("a-window-sizes", false, "no pre-change onsets for alignment".into());
+        return;
+    }
+    let raw_pre: Vec<i64> =
+        a_pre_idx.iter().map(|&i| onsets_l[i] as i64 - grid[i] as i64).collect();
+    let align1 = median(&raw_pre);
+    // align2 from A's post-resume onsets (sequential pairing).
+    let post_grid: Vec<u64> = grid.iter().copied().filter(|&g| g >= f_pause).collect();
+    let a_post_on: Vec<u64> = onsets_l[n_pre_grid.min(onsets_l.len())..]
+        .iter()
+        .map(|&o| o as u64)
+        .collect();
+    let n_post = a_post_on.len().min(post_grid.len());
+    gate(
+        "a-post-pause-count",
+        (a_post_on.len() as i64 - post_grid.len() as i64).abs() <= 2 && n_post >= 3,
+        format!("stem A post-resume: {} onsets vs {} predicted", a_post_on.len(), post_grid.len()),
+    );
+    if n_post < 3 {
+        return;
+    }
+    let raw_post: Vec<i64> =
+        (1..n_post).map(|i| a_post_on[i] as i64 - post_grid[i] as i64).collect();
+    let align2 = median(&raw_post);
+    let pause_wall = align2 - align1;
+    gate(
+        "pause-wall-duration",
+        (48_000..480_000).contains(&pause_wall),
+        format!(
+            "capture gained {pause_wall} frames across the pause (≈{:.2} s; F frozen, \
+             wall clock not) — sanity window [1 s, 10 s]",
+            pause_wall as f64 / 48_000.0
+        ),
+    );
+
+    // A's windows pre-pause: [0,t_tempo) / [t_tempo,t_var) / [t_var,f_pause).
+    let on_l: Vec<usize> = onsets_l.clone();
+    let wa1 = pair_window(&on_l, &grid, (0, t_tempo), align1, skip);
+    let wa2 = pair_window(&on_l, &grid, (t_tempo, t_var), align1, 1);
+    let wa3 = pair_window(&on_l, &grid, (t_var, f_pause), align1, 1);
+    let wa4 = pair_window(&on_l, &grid, (f_pause, u64::MAX), align2, 1);
+    let (Some(wa1), Some(wa2), Some(wa3), Some(wa4)) = (wa1, wa2, wa3, wa4) else {
+        gate("a-window-sizes", false, "a stem-A window had too few onsets".into());
+        return;
+    };
+    gate(
+        "a-window-sizes",
+        wa1.window.offsets.len() >= thresholds::MIN_WINDOW_ONSETS
+            && wa2.window.offsets.len() >= 4
+            && wa3.window.offsets.len() >= 4
+            && wa4.window.offsets.len() >= thresholds::MIN_WINDOW_ONSETS,
+        format!(
+            "stem A windows: {}/{}/{}/{} onsets",
+            wa1.window.offsets.len(),
+            wa2.window.offsets.len(),
+            wa3.window.offsets.len(),
+            wa4.window.offsets.len()
+        ),
+    );
+    for (name, w) in [("a-zero-accum-pre", &wa1), ("a-zero-accum-post-resume", &wa4)] {
+        if w.window.offsets.len() < thresholds::MIN_SLOPE_WINDOW_ONSETS {
+            gate(name, true, format!("{} onsets — bounded by step gates", w.window.offsets.len()));
+            continue;
+        }
+        let (ok, detail) = zero_accumulation(&w.window);
+        gate(name, ok, detail);
+    }
+    let step_tempo = wa2.window.median - wa1.window.median;
+    gate(
+        "a-offset-equal-across-tempo-change",
+        step_tempo.abs() <= thresholds::TEMPO_CHANGE_STEP_MAX,
+        format!(
+            "stem A median: pre {} vs post-change {} (step {step_tempo}, gate ≤ {})",
+            wa1.window.median, wa2.window.median, thresholds::TEMPO_CHANGE_STEP_MAX
+        ),
+    );
+    let step_var = wa3.window.median - wa2.window.median;
+    gate(
+        "a-offset-equal-across-variation",
+        step_var.abs() <= thresholds::TEMPO_CHANGE_STEP_MAX,
+        format!("step {step_var} across the variation switch (gate ≤ {})", thresholds::TEMPO_CHANGE_STEP_MAX),
+    );
+
+    // ---- Stem B (R): silent in [mute_on,mute_off) and [solo_on,solo_off). --
+    let beat = (K / log.segments[0].1 as u128) as i64;
+    let margin = beat / 2;
+    let silent = |name: &str, lo: u64, hi: u64, gate: &mut dyn FnMut(&str, bool, String)| {
+        let lo_c = lo as i64 + align1 + margin;
+        let hi_c = hi as i64 + align1 - margin;
+        let intruders = onsets_r
+            .iter()
+            .filter(|&&o| (o as i64) > lo_c && (o as i64) < hi_c)
+            .count();
+        gate(
+            name,
+            intruders == 0,
+            format!("{intruders} onsets inside the predicted silent window [{lo_c}, {hi_c}] (gate: 0)"),
+        );
+    };
+    silent("b-mute-window-silent", mute_on, mute_off, gate);
+    silent("b-solo-window-silent", solo_on, solo_off, gate);
+
+    let on_r: Vec<usize> = onsets_r.clone();
+    let wb1 = pair_window(&on_r, &grid, (0, mute_on), align1, skip);
+    let wb2 = pair_window(&on_r, &grid, (mute_off, solo_on), align1, 1);
+    let wb3 = pair_window(&on_r, &grid, (solo_off, t_tempo), align1, 1);
+    let wb4 = pair_window(&on_r, &grid, (t_tempo, f_pause), align1, 1);
+    let wb5 = pair_window(&on_r, &grid, (f_pause, u64::MAX), align2, 1);
+    let (Some(wb1), Some(wb2), Some(wb3), Some(wb4), Some(wb5)) = (wb1, wb2, wb3, wb4, wb5)
+    else {
+        gate("b-window-sizes", false, "a stem-B window had too few onsets".into());
+        return;
+    };
+    for (name, w) in [
+        ("b-count-pre-mute", &wb1),
+        ("b-count-between", &wb2),
+        ("b-count-post-solo", &wb3),
+        ("b-count-post-tempo", &wb4),
+        ("b-count-post-resume", &wb5),
+    ] {
+        gate(
+            name,
+            (w.detected as i64 - w.expected as i64).abs() <= 1,
+            format!("{} onsets vs {} predicted", w.detected, w.expected),
+        );
+    }
+    // Re-entry equality across each silenced window (the §3.2 claim: silence
+    // cannot desync) and across the tempo change.
+    for (name, a, b, max) in [
+        ("b-re-entry-across-mute", wb1.window.median, wb2.window.median, thresholds::RE_ENTRY_STEP_MAX),
+        ("b-re-entry-across-solo", wb2.window.median, wb3.window.median, thresholds::RE_ENTRY_STEP_MAX),
+        ("b-offset-equal-across-tempo-change", wb3.window.median, wb4.window.median, thresholds::TEMPO_CHANGE_STEP_MAX),
+    ] {
+        let step = b - a;
+        gate(name, step.abs() <= max, format!("median {a} → {b} (step {step}, gate ≤ {max})"));
+    }
+    // Cross-stem offset equality across the pause (alignment-free).
+    let cross_pre = wb4.window.median - wa3.window.median;
+    let cross_post = wb5.window.median - wa4.window.median;
+    gate(
+        "cross-offset-equal-across-pause",
+        (cross_post - cross_pre).abs() <= thresholds::TEMPO_CHANGE_STEP_MAX,
+        format!("cross-stem offset pre {cross_pre} vs post {cross_post} (gate ≤ {})", thresholds::TEMPO_CHANGE_STEP_MAX),
+    );
+
+    report.analyzed_pairs = wa1.window.offsets.len() + wa4.window.offsets.len();
+    report.timing = Some(TimingNumbers {
+        tempo_change_frame: t_tempo,
+        b_stop_frame: mute_on,
+        b_restart_frame: mute_off,
+        variation_frame: Some(t_var),
+        align_offset: align1,
+        a_median_pre: wa1.window.median,
+        a_median_post: wa4.window.median,
+        b_median_pre: wb1.window.median,
+        b_median_post: wb5.window.median,
+        a_slope_pre: wa1.window.slope,
+        a_slope_post: wa4.window.slope,
+        b_slope_post: wb5.window.slope,
+    });
+}
+
+// ---------------------------------------------------------------------------
+// C2 memory analysis (spec §4.11): budget, lazy switch, eviction, no gap
+// ---------------------------------------------------------------------------
+
+fn analyze_memory(
+    wav: &maestro_core::validation::LoadedWav,
+    hr: &serde_json::Value,
+    tempo_mbpm: u64,
+    gate: &mut impl FnMut(&str, bool, String),
+    report: &mut Report,
+) {
+    let log = parse_command_log(hr, tempo_mbpm).unwrap_or_else(|e| panic!("command log: {e}"));
+
+    // Budget (spec §4.11): every polled snapshot AND the final one stay under
+    // the per-song PCM budget — including through the lazy switch.
+    let mut max_bytes = hr
+        .get("finalSnapshot")
+        .and_then(|s| s.get("pcmBytesInUse"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(u64::MAX);
+    let mut saw_switched_variation = false;
+    if let Some(snaps) = hr.get("snapshots").and_then(|s| s.as_array()) {
+        for s in snaps {
+            if let Some(b) = s.get("pcmBytesInUse").and_then(|v| v.as_u64()) {
+                max_bytes = max_bytes.max(b);
+            }
+            if let Some(tracks) = s.get("tracks").and_then(|t| t.as_array()) {
+                if tracks
+                    .iter()
+                    .any(|t| t.get("slot").and_then(|v| v.as_u64()) == Some(0)
+                        && t.get("variation").and_then(|v| v.as_u64()) == Some(2))
+                {
+                    saw_switched_variation = true;
+                }
+            }
+        }
+    }
+    gate(
+        "pcm-budget",
+        max_bytes <= thresholds::MEMORY_PCM_BUDGET_BYTES,
+        format!(
+            "max pcmBytesInUse {:.1} MB (budget {} MB, spec §4.11)",
+            max_bytes as f64 / (1024.0 * 1024.0),
+            thresholds::MEMORY_PCM_BUDGET_BYTES / (1024 * 1024)
+        ),
+    );
+
+    // Lazy switch life cycle: requested → loaded → applied (+ eviction once
+    // the song's PCM exceeds the budget), all engine-echoed.
+    gate(
+        "variation-load-required",
+        log.variation_load_required,
+        format!("variationLoadRequired echoed: {}", log.variation_load_required),
+    );
+    gate(
+        "variation-applied",
+        log.variation_at.is_some() && saw_switched_variation,
+        format!(
+            "variationApplied at {:?}; snapshot shows variation 2 on slot 0: {}",
+            log.variation_at, saw_switched_variation
+        ),
+    );
+    gate(
+        "variation-evicted",
+        log.variation_evicted,
+        format!("variationEvicted echoed (budget enforcement observable): {}", log.variation_evicted),
+    );
+
+    // Load health: every TrackLoaded must reconcile, identically, with zero
+    // failures — this is the D4 fix running against REAL R2 files + measured
+    // per-file metadata on the REAL device decoder.
+    let mut reconciliations: Vec<String> = Vec::new();
+    let mut load_failures: Vec<String> = Vec::new();
+    if let Some(events) = hr.get("events").and_then(|e| e.as_array()) {
+        for e in events {
+            match e.get("type").and_then(|t| t.as_str()) {
+                Some("trackLoaded") => reconciliations.push(
+                    e.get("reconciliation").and_then(|r| r.as_str()).unwrap_or("?").to_string(),
+                ),
+                Some("trackLoadFailed") => load_failures
+                    .push(e.get("reason").and_then(|r| r.as_str()).unwrap_or("?").to_string()),
+                _ => {}
+            }
+        }
+    }
+    let all_same = reconciliations.windows(2).all(|w| w[0] == w[1]);
+    gate(
+        "loads-reconcile",
+        reconciliations.len() >= 6 && all_same && load_failures.is_empty(),
+        format!(
+            "{} loads reconciled as {:?} (stable: {all_same}); failures: {load_failures:?}",
+            reconciliations.len(),
+            reconciliations.first()
+        ),
+    );
+
+    // No audio gap on the playing stems (spec §4.11): every GAP_WINDOW of the
+    // sustained stem (L = pad) keeps an RMS floor from start-of-sound to the
+    // capture tail; the rhythmic stem (R) is present overall.
+    let win = (thresholds::GAP_WINDOW_SECONDS * wav.sample_rate as f64) as usize;
+    let l = &wav.channels[0];
+    let start = 2 * wav.sample_rate as usize; // skip ramp-in
+    let end = wav.frames.saturating_sub(wav.sample_rate as usize);
+    let mut worst = f64::INFINITY;
+    let mut worst_at = 0usize;
+    let mut pos = start;
+    while pos + win <= end {
+        let rms = (l[pos..pos + win].iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>()
+            / win as f64)
+            .sqrt();
+        if rms < worst {
+            worst = rms;
+            worst_at = pos;
+        }
+        pos += win / 2;
+    }
+    gate(
+        "no-audio-gap",
+        worst > thresholds::GAP_RMS_FLOOR,
+        format!(
+            "worst {:.1} ms window RMS {worst:.5} at {:.1} s (floor {}, spec §4.11 — the lazy \
+             switch must not gap the playing stems)",
+            thresholds::GAP_WINDOW_SECONDS * 1000.0,
+            worst_at as f64 / wav.sample_rate as f64,
+            thresholds::GAP_RMS_FLOOR
+        ),
+    );
+    let r = &wav.channels[1];
+    let r_rms = (r[start..end.max(start + 1)]
+        .iter()
+        .map(|&x| (x as f64) * (x as f64))
+        .sum::<f64>()
+        / (end.max(start + 1) - start) as f64)
+        .sqrt();
+    gate(
+        "rhythmic-stem-present",
+        r_rms > thresholds::GAP_RMS_FLOOR,
+        format!("stem R overall RMS {r_rms:.5} (floor {})", thresholds::GAP_RMS_FLOOR),
+    );
+    report.analyzed_pairs = 0;
 }

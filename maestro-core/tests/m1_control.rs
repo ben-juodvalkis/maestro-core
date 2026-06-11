@@ -38,7 +38,7 @@ fn engine_with_sine(tempo: u32, hz: f32) -> (ControlPlane, Box<AudioCore>) {
         .load_pcm(&meta(0, 0), l, r)
         .expect("base variation loads");
     assert!(matches!(
-        plane.dispatch(Command::Activate { slot: 0, quantize: QuantizePolicy::Immediate }),
+        plane.dispatch(Command::Activate { slot: 0, quantize: QuantizePolicy::Immediate , transport: Default::default() }),
         CommandResult::Ok
     ));
     assert!(matches!(plane.dispatch(Command::Play), CommandResult::Ok));
@@ -47,6 +47,7 @@ fn engine_with_sine(tempo: u32, hz: f32) -> (ControlPlane, Box<AudioCore>) {
 
 fn meta(slot: u8, variation: u8) -> LoadMeta {
     LoadMeta {
+        sample_rate: 48_000,
         slot,
         original_tempo_mbpm: O_MBPM,
         loop_beats: LOOP_BEATS,
@@ -231,6 +232,7 @@ fn tempo_and_load_reject_out_of_range_rates() {
     plane
         .load_pcm(
             &LoadMeta {
+                sample_rate: 48_000,
                 slot: 1,
                 original_tempo_mbpm: 60_000,
                 loop_beats: 16,
@@ -262,6 +264,7 @@ fn tempo_and_load_reject_out_of_range_rates() {
     let (l2, r2) = make_sine_pcm(192_000, 880.0);
     let res = plane.load_pcm(
         &LoadMeta {
+            sample_rate: 48_000,
             slot: 2,
             original_tempo_mbpm: 240_000, // rate at tempo 240k is 1.0 — fine…
             loop_beats: 16,
@@ -279,6 +282,7 @@ fn tempo_and_load_reject_out_of_range_rates() {
     let (l3, r3) = make_sine_pcm(1_536_000, 55.0);
     let res = plane.load_pcm(
         &LoadMeta {
+            sample_rate: 48_000,
             slot: 3,
             original_tempo_mbpm: 30_000, // rate at tempo 240k would be 8.0
             loop_beats: 16,
@@ -321,7 +325,7 @@ fn next_bar_activation_on_boundary_is_immediate() {
         core.render(&mut lbuf, &mut rbuf);
     }
     assert!(matches!(
-        plane.dispatch(Command::Activate { slot: 0, quantize: QuantizePolicy::NextBar }),
+        plane.dispatch(Command::Activate { slot: 0, quantize: QuantizePolicy::NextBar , transport: Default::default() }),
         CommandResult::Ok
     ));
     core.render(&mut lbuf, &mut rbuf);

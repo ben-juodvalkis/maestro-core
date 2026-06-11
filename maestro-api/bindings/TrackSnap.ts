@@ -9,8 +9,13 @@ export type TrackSnap = { slot: number, status: TrackStatus,
 /**
  * Currently rendering variation (spec §3.5).
  */
-variation: number, loopCount: number, 
+variation: number, gain: number, pan: number, muted: boolean, solo: boolean, loopCount: number, 
 /**
  * Derived from bu(F) mod Λ. Display only — floats never feed timing.
  */
-loopProgress: number, rmsL: number, rmsR: number, peakL: number, peakR: number, };
+loopProgress: number, 
+/**
+ * Per-track level metering over the last rendered block (post gain/pan,
+ * the track's contribution to the mix). Zero while inaudible.
+ */
+rmsL: number, rmsR: number, peakL: number, peakR: number, };

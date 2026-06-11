@@ -3,12 +3,20 @@
 /**
  * Per-file PCM metadata handed to `load_pcm` (spec §3.4). Lengths are
  * reconciled in Rust, decoder-agnostically; mismatch is a hard load failure.
+ * Every field is MEASURED by the encoding pipeline from the actual encoded
+ * file (per file, not per stem) — nothing here is asserted by hand.
  */
 export type LoadMeta = { 
 /**
  * Stable slot index (0..MAX_TRACKS) chosen by the backend.
  */
 slot: number, 
+/**
+ * Decoded sample rate as the shim observed it. Must be 48_000 — the
+ * engine never resamples (spec §3.4#3/§4.7); anything else is a hard
+ * `TrackLoadFailed`, re-validated here in Rust (defense in depth, §4.12).
+ */
+sampleRate: number, 
 /**
  * Track's original tempo in milli-BPM (integer; never 0 — load fails).
  */
@@ -30,11 +38,11 @@ originalSamples: bigint,
  * occupied slot performs an engine-side variation switch (Arc PCM swap +
  * re-anchor + one-block crossfade at a block boundary, spec §3.2); all
  * variations of a stem must declare identical musical identity
- * (`loop_beats` / `original_samples` / `original_tempo_mbpm`) or the
- * load fails loudly (spec §3.4).
+ * (`loop_beats` / `original_samples` / `original_tempo_mbpm`) — and
+ * reconcile the same way — or the load fails loudly (spec §3.4).
  */
 variation: number, 
 /**
- * Initial gain/pan so M0 can hard-pan the metronome stems without a mixer surface.
+ * Initial gain/pan (same validation as SetGain/SetPan).
  */
 gain: number, pan: number, };

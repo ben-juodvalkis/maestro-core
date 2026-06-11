@@ -10,17 +10,16 @@
 //! The transport surface is total and tiny (spec §3.6):
 //!
 //! ```text
-//! init(config) ; dispatch(command_json) -> result_json    // control plane
+//! init(config) ; dispatch(command_json) -> result_json    // control plane, ≤ 60 Hz
 //! snapshot_json() -> String ; drain_events_json() -> String
 //! load_pcm(track, variation, bytes, meta) -> result       // the one bulk-data call
 //! maestro_render(core, buffers, frames)                   // C ABI, audio thread only
 //! ```
 //!
-//! **M1 scope:** the full timing surface (spec §5 M1) — live tempo changes,
-//! pause/resume, quantized and immediate activation, per-track pitch, and
-//! variation switching. Remaining breadth (volume/pan/mute/solo, full track
-//! lifecycle, safety presets) lands in M2 as additional variants; adding an
-//! operation = one enum variant + one match arm.
+//! **M2 scope:** the full control plane (spec §5 M2) — volume/pan/mute/solo,
+//! full track lifecycle, transport safety policy, async variation switching
+//! under the §4.11 memory policy, per-track level metering, and the §3.4
+//! decode/trim surface (per-file measured metadata; `sample_rate` asserted).
 
 use serde::{Deserialize, Serialize};
 
@@ -40,6 +39,22 @@ pub struct EngineConfig {
     pub beats_per_bar: u32,
 }
 
+/// Transport side-effect policy for track activation/deactivation — the
+/// engine-side encoding of the app's transport safety presets (ADR-092):
+/// `Manual` never touches the transport (slider/programmatic operations);
+/// `Auto` lets `Activate` start a stopped transport and lets `Deactivate`
+/// stop the transport (epoch reset) when the last armed track disarms.
+/// The §3.1 default stands: without `Auto`, individually stopping the last
+/// stem does NOT stop the transport or reset the epoch.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
+pub enum TransportPolicy {
+    #[default]
+    Manual,
+    Auto,
+}
+
 /// Commands accepted by `dispatch`. Applied by the audio thread at the next
 /// block boundary; nothing timing-critical crosses the bridge (spec §3.5).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,7 +64,8 @@ pub enum Command {
     /// Start the transport. The master frame clock `F` advances only while playing.
     Play,
     /// Stop the transport and reset the timeline epoch (bar 1 beat 1).
-    /// Individually deactivating the last audible track does NOT do this (spec §3.1).
+    /// Individually deactivating the last audible track does NOT do this
+    /// (spec §3.1) unless that `Deactivate` carries `TransportPolicy::Auto`.
     Stop,
     /// Freeze the master clock `F` — for all tracks at once, with **no epoch
     /// reset** (distinct from `Stop`, spec §3.1). Positions are derived from
@@ -68,21 +84,52 @@ pub enum Command {
     SetTempo { mbpm: u32 },
     /// Make an installed track audible. `quantize` chooses the activation
     /// frame policy; the engine computes the frame — JS never does (spec §3.5).
+    /// `transport: Auto` additionally starts a stopped transport (safety
+    /// presets, ADR-092).
     Activate {
         slot: u8,
         #[serde(default)]
         quantize: QuantizePolicy,
+        #[serde(default)]
+        transport: TransportPolicy,
     },
     /// Silence a track. Its musical position remains derived from the timeline;
-    /// reactivation cannot desync by construction (spec §3.2).
-    Deactivate { slot: u8 },
-    /// Remove a track and free its slot. PCM is reclaimed off the audio thread.
+    /// reactivation cannot desync by construction (spec §3.2). With
+    /// `transport: Auto`, deactivating the LAST active track also stops the
+    /// transport (epoch reset) — the engine decides, echoing `Stopped`.
+    Deactivate {
+        slot: u8,
+        #[serde(default)]
+        transport: TransportPolicy,
+    },
+    /// Remove a track and free its slot (and its cached variations). PCM is
+    /// reclaimed off the audio thread.
     RemoveTrack { slot: u8 },
+    /// Per-track gain in [0.0, 2.0] (rejected outside — never clamped). A
+    /// track at effective gain 0 skips its read/stretch DSP entirely and
+    /// re-anchors under the activation ramp on becoming audible again
+    /// (spec §3.2 — silence costs nothing and cannot desync).
+    SetGain { slot: u8, gain: f32 },
+    /// Per-track equal-power pan in [-1.0, 1.0] (rejected outside).
+    SetPan { slot: u8, pan: f32 },
+    /// Mute/unmute. Muted tracks skip DSP and re-anchor on unmute (spec §3.2).
+    SetMute { slot: u8, muted: bool },
+    /// Solo on/off. While any track is soloed, non-soloed tracks are silent
+    /// (and skip DSP); clearing the last solo restores them under the
+    /// activation ramp.
+    SetSolo { slot: u8, solo: bool },
     /// Per-track pitch shift in semitones (spec §3.2 / §4.8: ±12, rejected —
     /// never clamped — outside that range). A pitch shift on a unity track
     /// promotes it to the stretch path under the one-block crossfade; position
     /// math is unaffected.
     SetPitch { slot: u8, semitones: f32 },
+    /// Switch a track to another variation (spec §3.2 / §4.11). If the
+    /// variation's PCM is cached, the swap applies at the next block boundary
+    /// (Arc swap + re-anchor + one-block crossfade). Otherwise the command is
+    /// acknowledged, `Event::VariationLoadRequired` asks the platform to
+    /// decode and call `load_pcm`, and the swap applies on load completion —
+    /// `Event::VariationApplied` signals it either way.
+    SwitchVariation { slot: u8, variation: u8 },
 }
 
 /// Activation-frame policy for [`Command::Activate`] (spec §3.1):
@@ -110,12 +157,18 @@ pub enum CommandResult {
 
 /// Per-file PCM metadata handed to `load_pcm` (spec §3.4). Lengths are
 /// reconciled in Rust, decoder-agnostically; mismatch is a hard load failure.
+/// Every field is MEASURED by the encoding pipeline from the actual encoded
+/// file (per file, not per stem) — nothing here is asserted by hand.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 pub struct LoadMeta {
     /// Stable slot index (0..MAX_TRACKS) chosen by the backend.
     pub slot: u8,
+    /// Decoded sample rate as the shim observed it. Must be 48_000 — the
+    /// engine never resamples (spec §3.4#3/§4.7); anything else is a hard
+    /// `TrackLoadFailed`, re-validated here in Rust (defense in depth, §4.12).
+    pub sample_rate: u32,
     /// Track's original tempo in milli-BPM (integer; never 0 — load fails).
     pub original_tempo_mbpm: u32,
     /// Exact musical loop length in beats (integer; authoritative for wrapping).
@@ -129,11 +182,11 @@ pub struct LoadMeta {
     /// occupied slot performs an engine-side variation switch (Arc PCM swap +
     /// re-anchor + one-block crossfade at a block boundary, spec §3.2); all
     /// variations of a stem must declare identical musical identity
-    /// (`loop_beats` / `original_samples` / `original_tempo_mbpm`) or the
-    /// load fails loudly (spec §3.4).
+    /// (`loop_beats` / `original_samples` / `original_tempo_mbpm`) — and
+    /// reconcile the same way — or the load fails loudly (spec §3.4).
     #[serde(default)]
     pub variation: u8,
-    /// Initial gain/pan so M0 can hard-pan the metronome stems without a mixer surface.
+    /// Initial gain/pan (same validation as SetGain/SetPan).
     pub gain: f32,
     pub pan: f32,
 }
@@ -144,8 +197,11 @@ pub struct LoadMeta {
 #[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 pub enum Event {
-    TrackLoaded { slot: u8, reconciliation: String },
+    /// `reconciliation` names which §3.4 case fired ("alreadyTrimmed" /
+    /// "trimmedHere"); asserted stable across variations of a stem.
+    TrackLoaded { slot: u8, variation: u8, reconciliation: String },
     TrackLoadFailed { slot: u8, reason: String },
+    TrackRemoved { slot: u8 },
     Started,
     Stopped,
     /// `F` froze at `at_frame` (no epoch reset — distinct from `Stopped`).
@@ -160,11 +216,27 @@ pub enum Event {
     /// the quantized activation frame `F_q` for `QuantizePolicy::NextBar`).
     TrackActivated { slot: u8, at_frame: u64 },
     TrackDeactivated { slot: u8, at_frame: u64 },
-    /// Variation switch applied at a block boundary (spec §3.2).
+    /// Mute state applied at exactly `at_frame` — the analyzer's predicted
+    /// silent-window boundary for mute legs (spec §6.4 methodology).
+    MuteApplied { slot: u8, muted: bool, at_frame: u64 },
+    SoloApplied { slot: u8, solo: bool, at_frame: u64 },
+    /// Variation switch applied at a block boundary (spec §3.2). For an async
+    /// switch (§4.11) this fires on load completion.
     VariationApplied { slot: u8, variation: u8, at_frame: u64 },
+    /// Async variation switch (§4.11): the requested variation is not cached;
+    /// the platform must decode it and call `load_pcm` with this slot and
+    /// variation. The engine keeps playing the current variation meanwhile.
+    VariationLoadRequired { slot: u8, variation: u8 },
+    /// A cached (non-audible) variation was evicted under the §4.11 per-song
+    /// PCM budget.
+    VariationEvicted { slot: u8, variation: u8 },
     LoopWrapped { slot: u8, wrap_count: u32 },
     Underrun,
     BudgetExceeded { render_ns: u64, period_ns: u64 },
+    /// The RT event queue overflowed and `dropped` edge events were lost
+    /// since the last drain. Never silent (spec §6.7): the audio thread
+    /// counts drops in the snapshot and the control plane surfaces them here.
+    EventQueueOverflow { dropped: u32 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -196,9 +268,15 @@ pub struct TrackSnap {
     pub status: TrackStatus,
     /// Currently rendering variation (spec §3.5).
     pub variation: u8,
+    pub gain: f32,
+    pub pan: f32,
+    pub muted: bool,
+    pub solo: bool,
     pub loop_count: u32,
     /// Derived from bu(F) mod Λ. Display only — floats never feed timing.
     pub loop_progress: f32,
+    /// Per-track level metering over the last rendered block (post gain/pan,
+    /// the track's contribution to the mix). Zero while inaudible.
     pub rms_l: f32,
     pub rms_r: f32,
     pub peak_l: f32,
@@ -228,5 +306,11 @@ pub struct Snapshot {
     pub callback_period_ns: u64,
     pub blocks_total: u64,
     pub blocks_over_half_period: u64,
+    /// Edge events dropped on RT event-queue overflow (spec §6.7 — surfaced,
+    /// never silent). Monotonic since engine creation.
+    pub events_dropped: u32,
+    /// PCM bytes resident for this engine instance (installed + cached
+    /// variations) — the §4.11 per-song budget gate reads this.
+    pub pcm_bytes_in_use: u64,
     pub tracks: Vec<TrackSnap>,
 }

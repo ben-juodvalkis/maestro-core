@@ -134,6 +134,7 @@ pub fn build_engine_select(
         plane
             .load_pcm(
                 &LoadMeta {
+                    sample_rate: 48_000,
                     slot: slot as u8,
                     original_tempo_mbpm: t.o_mbpm,
                     loop_beats: t.loop_beats,
@@ -152,7 +153,7 @@ pub fn build_engine_select(
             let res = plane.dispatch(Command::Activate {
                 slot: slot as u8,
                 quantize: QuantizePolicy::Immediate,
-            });
+             transport: Default::default(), });
             assert!(matches!(res, maestro_api::CommandResult::Ok), "activate rejected: {res:?}");
         }
     }

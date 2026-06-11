@@ -18,4 +18,14 @@ bar: number, beatInBar: number, timelineEpoch: number,
  * `render_ns_max` against `callback_period_ns`. `underruns` counts blocks
  * whose render exceeded the full callback period.
  */
-underruns: number, renderNsMax: bigint, callbackPeriodNs: bigint, blocksTotal: bigint, blocksOverHalfPeriod: bigint, tracks: Array<TrackSnap>, };
+underruns: number, renderNsMax: bigint, callbackPeriodNs: bigint, blocksTotal: bigint, blocksOverHalfPeriod: bigint, 
+/**
+ * Edge events dropped on RT event-queue overflow (spec §6.7 — surfaced,
+ * never silent). Monotonic since engine creation.
+ */
+eventsDropped: number, 
+/**
+ * PCM bytes resident for this engine instance (installed + cached
+ * variations) — the §4.11 per-song budget gate reads this.
+ */
+pcmBytesInUse: bigint, tracks: Array<TrackSnap>, };

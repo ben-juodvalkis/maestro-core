@@ -137,11 +137,11 @@ fn m1_script(f_boundary: u64) -> Vec<ScriptEvent> {
             action: ScriptAction::Cmd(Command::Activate {
                 slot: 1,
                 quantize: QuantizePolicy::NextBar,
-            }),
+             transport: Default::default(), }),
         },
         ScriptEvent {
             at_frame: F_DEACT,
-            action: ScriptAction::Cmd(Command::Deactivate { slot: 0 }),
+            action: ScriptAction::Cmd(Command::Deactivate { slot: 0, transport: Default::default() }),
         },
         ScriptEvent {
             at_frame: F_TEMPO_MIDBAR_SILENT,
@@ -156,7 +156,7 @@ fn m1_script(f_boundary: u64) -> Vec<ScriptEvent> {
             action: ScriptAction::Cmd(Command::Activate {
                 slot: 0,
                 quantize: QuantizePolicy::Immediate,
-            }),
+             transport: Default::default(), }),
         },
     ]
 }

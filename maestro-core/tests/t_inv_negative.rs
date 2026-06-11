@@ -40,7 +40,7 @@ fn m1_negative_script() -> Vec<ScriptEvent> {
         ScriptEvent { at_frame: 4_200_000, action: ScriptAction::Cmd(Command::Resume) },
         ScriptEvent {
             at_frame: 4_600_000,
-            action: ScriptAction::Cmd(Command::Deactivate { slot: 0 }),
+            action: ScriptAction::Cmd(Command::Deactivate { slot: 0, transport: Default::default() }),
         },
         ScriptEvent {
             at_frame: 4_800_000,
@@ -51,7 +51,7 @@ fn m1_negative_script() -> Vec<ScriptEvent> {
             action: ScriptAction::Cmd(Command::Activate {
                 slot: 0,
                 quantize: QuantizePolicy::Immediate,
-            }),
+             transport: Default::default(), }),
         },
     ]
 }

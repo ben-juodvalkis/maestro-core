@@ -40,6 +40,10 @@ num-bigint = "0.4"
 assert_no_alloc = "1"
 # Harness-shaped report JSON for the offline analyzer smoke (spec §6.4).
 serde_json = "1"
+# Real AAC/M4A decode for T-LOAD (spec §3.4#3: tests/CLI use symphonia) — the
+# §6.5 fixtures are decoded by a third decoder so reconciliation is proven
+# decoder-agnostic, not tuned to AVAudioFile or ffmpeg.
+symphonia = { version = "0.5", default-features = false, features = ["aac", "isomp4"] }
 
 [features]
 default = ["native-stretch"]

@@ -70,8 +70,24 @@ pub enum RtCommand {
     SetTempo { mbpm: u32 },
     InstallTrack { slot: u8, state: Box<TrackState> },
     RemoveTrack { slot: u8 },
-    Activate { slot: u8, quantize: QuantizePolicy },
-    Deactivate { slot: u8 },
+    /// `auto_start` = TransportPolicy::Auto (ADR-092): also start a stopped
+    /// transport. The engine decides; JS never makes timing decisions.
+    Activate { slot: u8, quantize: QuantizePolicy, auto_start: bool },
+    /// `auto_stop` = TransportPolicy::Auto: if this deactivation leaves zero
+    /// active tracks, also stop the transport (epoch reset, echoed `Stopped`).
+    Deactivate { slot: u8, auto_stop: bool },
+    /// Per-track gain target (validated [0, 2] at the control plane). Applied
+    /// with a one-block ramp; effective gain 0 makes the track skip its DSP
+    /// entirely (spec §3.2).
+    SetGain { slot: u8, gain: f32 },
+    /// Per-track pan target (validated [-1, 1]); one-block ramp, audio-only.
+    SetPan { slot: u8, pan: f32 },
+    /// Mute/unmute (spec §3.2): mute ramps to silence then skips DSP; unmute
+    /// re-anchors under the activation ramp. Echoed with the exact frame.
+    SetMute { slot: u8, muted: bool },
+    /// Solo on/off: while any loaded track is soloed, non-soloed tracks are
+    /// inaudible (and skip DSP) — same re-anchor rule on restore.
+    SetSolo { slot: u8, solo: bool },
     /// Per-track pitch in semitones (validated ±12 at the control plane,
     /// spec §4.8). Audio-only: promotes a unity track to the stretch path
     /// under the one-block crossfade; positions are unaffected.
@@ -96,9 +112,40 @@ pub enum RtEvent {
     /// quantized activation frame `F_q`).
     Activated { slot: u8, at_frame: u64 },
     Deactivated { slot: u8, at_frame: u64 },
+    /// Mute/solo echoes (spec §6.4 methodology): the exact block-boundary
+    /// frame, so the device analyzer can predict mute silent windows.
+    MuteApplied { slot: u8, muted: bool, at_frame: u64 },
+    SoloApplied { slot: u8, solo: bool, at_frame: u64 },
+    Removed { slot: u8 },
     VariationApplied { slot: u8, variation: u8, at_frame: u64 },
     LoopWrapped { slot: u8, wrap_count: u32 },
     BudgetExceeded { render_ns: u64, period_ns: u64 },
+}
+
+/// Push an edge event, counting the drop if the queue is full (spec §6.7 —
+/// overflow is surfaced via the snapshot's `events_dropped`, never silent).
+/// Free function so it composes with split borrows of `AudioCore` fields.
+#[inline]
+fn push_event(events: &mut rtrb::Producer<RtEvent>, dropped: &mut u32, e: RtEvent) {
+    if events.push(e).is_err() {
+        *dropped = dropped.saturating_add(1);
+    }
+}
+
+/// Per-block level meter values (display only — floats never feed timing).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TrackMeter {
+    pub rms_l: f32,
+    pub rms_r: f32,
+    pub peak_l: f32,
+    pub peak_r: f32,
+}
+
+/// Equal-power pan + gain mix coefficients for a (gain, pan) pair.
+#[inline]
+fn mix_coefficients(gain: f32, pan: f32) -> (f32, f32) {
+    let theta = (pan.clamp(-1.0, 1.0) + 1.0) * std::f32::consts::FRAC_PI_4;
+    (theta.cos() * gain, theta.sin() * gain)
 }
 
 /// Resources the audio thread hands back for deallocation off-thread.
@@ -114,6 +161,10 @@ pub struct RawTrackSnap {
     pub occupied: bool,
     pub active: bool,
     pub variation: u8,
+    pub gain: f32,
+    pub pan: f32,
+    pub muted: bool,
+    pub solo: bool,
     pub loop_count: u32,
     pub loop_progress: f32,
     pub rms_l: f32,
@@ -141,6 +192,9 @@ pub struct RawSnapshot {
     pub callback_period_ns: u64,
     pub blocks_total: u64,
     pub blocks_over_half_period: u64,
+    /// Edge events dropped on RT event-queue overflow (spec §6.7 — surfaced,
+    /// never silent).
+    pub events_dropped: u32,
     pub tracks: [RawTrackSnap; MAX_TRACKS],
 }
 
@@ -159,6 +213,7 @@ impl RawSnapshot {
             callback_period_ns: 0,
             blocks_total: 0,
             blocks_over_half_period: 0,
+            events_dropped: 0,
             tracks: [RawTrackSnap::default(); MAX_TRACKS],
         }
     }
@@ -171,8 +226,24 @@ pub struct TrackState {
     map: TrackTimeline,
     pcm: Arc<PcmData>,
     active: bool,
+    /// Target gain/pan (control-plane validated). The render loop ramps the
+    /// applied mix coefficients toward these over one block — audio-only.
     gain: f32,
     pan: f32,
+    muted: bool,
+    solo: bool,
+    /// Mix coefficients actually applied at the end of the last rendered
+    /// block (post gain/pan/mute/solo), lerped per block for click-free
+    /// parameter changes. `None` after (re)entry — the activation ramp masks
+    /// the initial step.
+    applied_mix: Option<(f32, f32)>,
+    /// Whether the track rendered (was audible) last block — the spec §3.2
+    /// DSP-skip transition state: inaudible → audible re-anchors under the
+    /// activation ramp, exactly like a restart.
+    was_audible: bool,
+    /// Per-track level metering over the last rendered block (post gain/pan;
+    /// the track's contribution to the mix). Display only.
+    meter: TrackMeter,
     /// Currently rendering variation (display/echo only).
     variation: u8,
     /// User pitch shift in semitones (±12, validated control-side). Nonzero
@@ -238,6 +309,11 @@ impl TrackState {
             active: false,
             gain,
             pan,
+            muted: false,
+            solo: false,
+            applied_mix: None,
+            was_audible: false,
+            meter: TrackMeter::default(),
             variation,
             pitch_semitones: 0.0,
             applied_pitch: None,
@@ -334,6 +410,9 @@ pub struct AudioCore {
     render_ns_max: u64,
     blocks_total: u64,
     blocks_over_half_period: u64,
+    /// Edge events dropped on RT event-queue overflow (spec §6.7 — surfaced
+    /// via the snapshot, never silent).
+    events_dropped: u32,
     /// Plan B (render pump): ring-starvation underruns counted by the audio
     /// callback, merged into the snapshot's `underruns` (the C0 gate). Reading
     /// an atomic in `write_snapshot` is RT-safe.
@@ -367,6 +446,7 @@ impl AudioCore {
             render_ns_max: 0,
             blocks_total: 0,
             blocks_over_half_period: 0,
+            events_dropped: 0,
             external_underruns: None,
             #[cfg(feature = "drift-injection")]
             lcg: 0x9E37_79B9_7F4A_7C15,
@@ -430,6 +510,9 @@ impl AudioCore {
             let bu0 = self.timeline.bu(f0);
             let bu1 = self.timeline.bu(f0 + b as u64);
             let tempo = self.timeline.tempo_mbpm_at(f0);
+            // Solo semantics (spec §3.2): while any loaded track is soloed,
+            // non-soloed tracks are inaudible (and skip their DSP entirely).
+            let any_solo = self.tracks.iter().flatten().any(|t| t.solo);
             for slot in 0..MAX_TRACKS {
                 if let Some(ts) = self.tracks[slot].as_deref_mut() {
                     // Quantized activation (spec §3.1): split the block at the
@@ -454,18 +537,52 @@ impl AudioCore {
                                 ts.ramp_remaining = ACTIVATION_RAMP_FRAMES;
                                 let f_q = f0 + d as u64;
                                 ts.last_wrap_count = ts.map.wrap_count(self.timeline.bu(f_q));
-                                let _ = self
-                                    .events
-                                    .push(RtEvent::Activated { slot: slot as u8, at_frame: f_q });
+                                push_event(
+                                    &mut self.events,
+                                    &mut self.events_dropped,
+                                    RtEvent::Activated { slot: slot as u8, at_frame: f_q },
+                                );
                                 offset = d;
                             }
                             // d == b: F_q is the next block's first frame —
                             // activation happens there (bu_q == its bu0).
                         }
                     }
+                    // Audibility (spec §3.2): a muted / soloed-out / gain-0
+                    // track skips its read/stretch DSP entirely — there is no
+                    // cursor to keep warm. `had_signal` lets a track that just
+                    // became inaudible render ONE more block, ramping its mix
+                    // coefficients to zero (click-free), before skipping.
+                    let soloed_out = any_solo && !ts.solo;
+                    let audible_target =
+                        ts.active && !ts.muted && !soloed_out && ts.gain > 0.0;
+                    let target_gain = if audible_target { ts.gain } else { 0.0 };
+                    let had_signal = ts.applied_mix.is_some_and(|(l, r)| l != 0.0 || r != 0.0);
                     if !ts.active {
+                        ts.was_audible = false;
+                        ts.applied_mix = None;
+                        ts.meter = TrackMeter::default();
                         continue;
                     }
+                    if !audible_target && !had_signal {
+                        // Fully silent: skip DSP. Positions stay derived from
+                        // F; on becoming audible the track re-anchors under
+                        // the activation ramp, exactly like a restart —
+                        // silence costs nothing and cannot desync (spec §3.2).
+                        ts.was_audible = false;
+                        ts.meter = TrackMeter::default();
+                        ts.last_wrap_count = ts.map.wrap_count(bu1);
+                        continue;
+                    }
+                    if audible_target && !ts.was_audible {
+                        // Inaudible → audible: re-anchor under the ramp.
+                        ts.needs_anchor = true;
+                        ts.prev_unity = None;
+                        ts.ramp_remaining = ACTIVATION_RAMP_FRAMES;
+                        ts.applied_mix = None;
+                        ts.last_wrap_count = ts.map.wrap_count(bu0);
+                    }
+                    ts.was_audible = audible_target;
                     let bu_start =
                         if offset == 0 { bu0 } else { self.timeline.bu(f0 + offset as u64) };
                     render_track(
@@ -473,6 +590,7 @@ impl AudioCore {
                         bu_start,
                         bu1,
                         tempo,
+                        target_gain,
                         b - offset,
                         &mut left[offset..b],
                         &mut right[offset..b],
@@ -481,9 +599,11 @@ impl AudioCore {
                     let w = ts.map.wrap_count(bu1);
                     if w > ts.last_wrap_count {
                         ts.last_wrap_count = w;
-                        let _ = self
-                            .events
-                            .push(RtEvent::LoopWrapped { slot: slot as u8, wrap_count: w as u32 });
+                        push_event(
+                            &mut self.events,
+                            &mut self.events_dropped,
+                            RtEvent::LoopWrapped { slot: slot as u8, wrap_count: w as u32 },
+                        );
                     }
                 }
             }
@@ -501,7 +621,11 @@ impl AudioCore {
         }
         if render_ns > period_ns {
             self.underruns += 1;
-            let _ = self.events.push(RtEvent::BudgetExceeded { render_ns, period_ns });
+            push_event(
+                &mut self.events,
+                &mut self.events_dropped,
+                RtEvent::BudgetExceeded { render_ns, period_ns },
+            );
         }
 
         self.write_snapshot(period_ns);
@@ -529,49 +653,18 @@ impl AudioCore {
         while self.reclaim.slots() > 0 {
             let Ok(cmd) = self.commands.pop() else { return };
             match cmd {
-                RtCommand::Play => {
-                    if !self.playing {
-                        self.playing = true;
-                        self.paused = false;
-                        for ts in self.tracks.iter_mut().flatten() {
-                            ts.needs_anchor = true;
-                            ts.prev_unity = None;
-                            if ts.active {
-                                ts.ramp_remaining = ACTIVATION_RAMP_FRAMES;
-                            }
-                        }
-                        let _ = self.events.push(RtEvent::Started);
-                    }
-                }
-                RtCommand::Stop => {
-                    if self.playing {
-                        self.playing = false;
-                        self.paused = false;
-                        let tempo = self.timeline.tempo_mbpm_at(self.frame);
-                        // Explicit transport stop is one of the two epoch-reset
-                        // flows (spec §3.1).
-                        let _ = self.timeline.reset(self.frame, tempo);
-                        for ts in self.tracks.iter_mut().flatten() {
-                            ts.needs_anchor = true;
-                            ts.prev_unity = None;
-                            ts.last_wrap_count = 0;
-                            // The epoch reset invalidates any quantized
-                            // activation target (it was a bu of the old epoch).
-                            ts.pending_bu = None;
-                            #[cfg(feature = "drift-injection")]
-                            {
-                                ts.float_cursor = None;
-                            }
-                        }
-                        let _ = self.events.push(RtEvent::Stopped);
-                    }
-                }
+                RtCommand::Play => self.do_play(),
+                RtCommand::Stop => self.do_stop(),
                 RtCommand::Pause => {
                     // F freezes for all tracks at once; no epoch reset, no
                     // per-track state to touch (positions are derived).
                     if self.playing && !self.paused {
                         self.paused = true;
-                        let _ = self.events.push(RtEvent::Paused { at_frame: self.frame });
+                        push_event(
+                            &mut self.events,
+                            &mut self.events_dropped,
+                            RtEvent::Paused { at_frame: self.frame },
+                        );
                     }
                 }
                 RtCommand::Resume => {
@@ -586,16 +679,22 @@ impl AudioCore {
                                 ts.ramp_remaining = ts.ramp_remaining.max(ACTIVATION_RAMP_FRAMES);
                             }
                         }
-                        let _ = self.events.push(RtEvent::Resumed { at_frame: self.frame });
+                        push_event(
+                            &mut self.events,
+                            &mut self.events_dropped,
+                            RtEvent::Resumed { at_frame: self.frame },
+                        );
                     }
                 }
                 RtCommand::SetTempo { mbpm } => {
                     if self.timeline.set_tempo(self.frame, mbpm).is_ok() {
                         // Tempo echo (spec §3.1): the exact application frame,
                         // for the device analyzer's predicted onset grid.
-                        let _ = self
-                            .events
-                            .push(RtEvent::TempoApplied { mbpm, at_frame: self.frame });
+                        push_event(
+                            &mut self.events,
+                            &mut self.events_dropped,
+                            RtEvent::TempoApplied { mbpm, at_frame: self.frame },
+                        );
                     }
                 }
                 RtCommand::InstallTrack { slot, state } => {
@@ -611,9 +710,14 @@ impl AudioCore {
                 RtCommand::RemoveTrack { slot } => {
                     if let Some(old) = self.tracks.get_mut(slot as usize).and_then(Option::take) {
                         let _ = self.reclaim.push(Reclaimable::Track(old));
+                        push_event(
+                            &mut self.events,
+                            &mut self.events_dropped,
+                            RtEvent::Removed { slot },
+                        );
                     }
                 }
-                RtCommand::Activate { slot, quantize } => {
+                RtCommand::Activate { slot, quantize, auto_start } => {
                     let bu = self.timeline.bu(self.frame);
                     let frame = self.frame;
                     let bar_units = self.beats_per_bar as u128 * BEAT_UNITS_PER_BEAT;
@@ -627,9 +731,11 @@ impl AudioCore {
                                     ts.ramp_remaining = ACTIVATION_RAMP_FRAMES;
                                     ts.last_wrap_count = ts.map.wrap_count(bu);
                                     ts.pending_bu = None;
-                                    let _ = self
-                                        .events
-                                        .push(RtEvent::Activated { slot, at_frame: frame });
+                                    push_event(
+                                        &mut self.events,
+                                        &mut self.events_dropped,
+                                        RtEvent::Activated { slot, at_frame: frame },
+                                    );
                                 }
                                 QuantizePolicy::NextBar => {
                                     // Target the next bar boundary in beat-units
@@ -644,15 +750,71 @@ impl AudioCore {
                             }
                         }
                     }
+                    // Safety preset Auto (ADR-092): activating with a stopped
+                    // transport starts it — engine-decided, echoed `Started`.
+                    if auto_start && !self.playing {
+                        self.do_play();
+                    }
                 }
-                RtCommand::Deactivate { slot } => {
+                RtCommand::Deactivate { slot, auto_stop } => {
                     let frame = self.frame;
                     if let Some(ts) = self.tracks.get_mut(slot as usize).and_then(Option::as_deref_mut) {
                         if ts.active {
-                            let _ = self.events.push(RtEvent::Deactivated { slot, at_frame: frame });
+                            push_event(
+                                &mut self.events,
+                                &mut self.events_dropped,
+                                RtEvent::Deactivated { slot, at_frame: frame },
+                            );
                         }
                         ts.active = false;
                         ts.pending_bu = None;
+                    }
+                    // Safety preset Auto (ADR-092): deactivating the LAST
+                    // active track stops the transport (epoch reset). Without
+                    // Auto the §3.1 default stands: the timeline keeps running.
+                    if auto_stop
+                        && self.playing
+                        && !self.tracks.iter().flatten().any(|t| t.active || t.pending_bu.is_some())
+                    {
+                        self.do_stop();
+                    }
+                }
+                RtCommand::SetGain { slot, gain } => {
+                    if let Some(ts) = self.tracks.get_mut(slot as usize).and_then(Option::as_deref_mut) {
+                        // Audio-only target; the render loop ramps the applied
+                        // mix over one block. Gain 0 ⇒ DSP skip (spec §3.2).
+                        ts.gain = gain;
+                    }
+                }
+                RtCommand::SetPan { slot, pan } => {
+                    if let Some(ts) = self.tracks.get_mut(slot as usize).and_then(Option::as_deref_mut) {
+                        ts.pan = pan;
+                    }
+                }
+                RtCommand::SetMute { slot, muted } => {
+                    let frame = self.frame;
+                    if let Some(ts) = self.tracks.get_mut(slot as usize).and_then(Option::as_deref_mut) {
+                        if ts.muted != muted {
+                            ts.muted = muted;
+                            push_event(
+                                &mut self.events,
+                                &mut self.events_dropped,
+                                RtEvent::MuteApplied { slot, muted, at_frame: frame },
+                            );
+                        }
+                    }
+                }
+                RtCommand::SetSolo { slot, solo } => {
+                    let frame = self.frame;
+                    if let Some(ts) = self.tracks.get_mut(slot as usize).and_then(Option::as_deref_mut) {
+                        if ts.solo != solo {
+                            ts.solo = solo;
+                            push_event(
+                                &mut self.events,
+                                &mut self.events_dropped,
+                                RtEvent::SoloApplied { slot, solo, at_frame: frame },
+                            );
+                        }
                     }
                 }
                 RtCommand::SetPitch { slot, semitones } => {
@@ -670,7 +832,7 @@ impl AudioCore {
                         let old = std::mem::replace(&mut ts.pcm, pcm);
                         ts.variation = variation;
                         ts.needs_anchor = true;
-                        if ts.active && rendering {
+                        if ts.active && rendering && ts.was_audible {
                             // Crossfade against the outgoing PCM this block
                             // (spec §3.2); it is reclaimed after the fade.
                             if let Some(prev) = ts.xfade_old_pcm.replace(old) {
@@ -683,15 +845,59 @@ impl AudioCore {
                             // Not audible: no crossfade — hand it back now.
                             let _ = self.reclaim.push(Reclaimable::Pcm(old));
                         }
-                        let _ = self
-                            .events
-                            .push(RtEvent::VariationApplied { slot, variation, at_frame: frame });
+                        push_event(
+                            &mut self.events,
+                            &mut self.events_dropped,
+                            RtEvent::VariationApplied { slot, variation, at_frame: frame },
+                        );
                     } else {
                         // No track at that slot: the new PCM itself goes back.
                         let _ = self.reclaim.push(Reclaimable::Pcm(pcm));
                     }
                 }
             }
+        }
+    }
+
+    /// The Play flow (transport start). Shared by `RtCommand::Play` and the
+    /// `Activate` auto-start policy.
+    fn do_play(&mut self) {
+        if !self.playing {
+            self.playing = true;
+            self.paused = false;
+            for ts in self.tracks.iter_mut().flatten() {
+                ts.needs_anchor = true;
+                ts.prev_unity = None;
+                if ts.active {
+                    ts.ramp_remaining = ACTIVATION_RAMP_FRAMES;
+                }
+            }
+            push_event(&mut self.events, &mut self.events_dropped, RtEvent::Started);
+        }
+    }
+
+    /// The Stop flow: freeze `F` and reset the timeline epoch — one of the
+    /// two epoch-reset flows (spec §3.1). Shared by `RtCommand::Stop` and the
+    /// `Deactivate` auto-stop policy.
+    fn do_stop(&mut self) {
+        if self.playing {
+            self.playing = false;
+            self.paused = false;
+            let tempo = self.timeline.tempo_mbpm_at(self.frame);
+            let _ = self.timeline.reset(self.frame, tempo);
+            for ts in self.tracks.iter_mut().flatten() {
+                ts.needs_anchor = true;
+                ts.prev_unity = None;
+                ts.last_wrap_count = 0;
+                // The epoch reset invalidates any quantized
+                // activation target (it was a bu of the old epoch).
+                ts.pending_bu = None;
+                #[cfg(feature = "drift-injection")]
+                {
+                    ts.float_cursor = None;
+                }
+            }
+            push_event(&mut self.events, &mut self.events_dropped, RtEvent::Stopped);
         }
     }
 
@@ -705,14 +911,16 @@ impl AudioCore {
                     occupied: true,
                     active: ts.active,
                     variation: ts.variation,
+                    gain: ts.gain,
+                    pan: ts.pan,
+                    muted: ts.muted,
+                    solo: ts.solo,
                     loop_count: ts.map.wrap_count(bu) as u32,
                     loop_progress: crate::timeline::loop_progress_display(&ts.map, bu),
-                    // Level metering lands with the M2 control surface; M0
-                    // reports zeros (snapshot shape is already final).
-                    rms_l: 0.0,
-                    rms_r: 0.0,
-                    peak_l: 0.0,
-                    peak_r: 0.0,
+                    rms_l: ts.meter.rms_l,
+                    rms_r: ts.meter.rms_r,
+                    peak_l: ts.meter.peak_l,
+                    peak_r: ts.meter.peak_r,
                 };
             }
         }
@@ -734,6 +942,7 @@ impl AudioCore {
             callback_period_ns: period_ns,
             blocks_total: self.blocks_total,
             blocks_over_half_period: self.blocks_over_half_period,
+            events_dropped: self.events_dropped,
             tracks,
         });
     }
@@ -844,6 +1053,7 @@ fn render_track(
     bu0: u128,
     bu1: u128,
     tempo_mbpm: u32,
+    target_gain: f32,
     b: usize,
     left: &mut [f32],
     right: &mut [f32],
@@ -935,8 +1145,11 @@ fn render_track(
     }
 
     // Mix parameters lifted out before `rendered` borrows the scratch buffers.
-    let theta = (ts.pan.clamp(-1.0, 1.0) + 1.0) * std::f32::consts::FRAC_PI_4;
-    let (gl, gr) = (theta.cos() * ts.gain, theta.sin() * ts.gain);
+    // The applied coefficients ramp toward the target over this block
+    // (click-free gain/pan/mute changes); identical endpoints lerp to the
+    // exact constant, so the unity-bypass bit-exactness guarantee holds.
+    let (gl1, gr1) = mix_coefficients(target_gain, ts.pan);
+    let (gl0, gr0) = ts.applied_mix.unwrap_or((gl1, gr1));
     let mut ramp_remaining = ts.ramp_remaining;
 
     let rendered: &[f32] = if unity {
@@ -989,8 +1202,13 @@ fn render_track(
 
     // Equal-power pan + gain + activation ramp (+ one-block equal-power
     // crossfade when a fade-out source was rendered), mixed into the bus.
+    // Track contribution is metered here (post everything, display only).
     let ramp_total = ACTIVATION_RAMP_FRAMES as f32;
     let inv_b = 1.0 / b as f32;
+    let mut sumsq_l = 0.0f32;
+    let mut sumsq_r = 0.0f32;
+    let mut peak_l = 0.0f32;
+    let mut peak_r = 0.0f32;
     for i in 0..b {
         let g = if ramp_remaining > 0 {
             let g = 1.0 - ramp_remaining as f32 / ramp_total;
@@ -1009,10 +1227,26 @@ fn render_track(
         } else {
             (rendered[i * 2], rendered[i * 2 + 1])
         };
-        left[i] += l_s * gl * g;
-        right[i] += r_s * gr * g;
+        let t = (i + 1) as f32 * inv_b;
+        let gl = gl0 + (gl1 - gl0) * t;
+        let gr = gr0 + (gr1 - gr0) * t;
+        let c_l = l_s * gl * g;
+        let c_r = r_s * gr * g;
+        left[i] += c_l;
+        right[i] += c_r;
+        sumsq_l += c_l * c_l;
+        sumsq_r += c_r * c_r;
+        peak_l = peak_l.max(c_l.abs());
+        peak_r = peak_r.max(c_r.abs());
     }
     ts.ramp_remaining = ramp_remaining;
+    ts.applied_mix = Some((gl1, gr1));
+    ts.meter = TrackMeter {
+        rms_l: (sumsq_l * inv_b).sqrt(),
+        rms_r: (sumsq_r * inv_b).sqrt(),
+        peak_l,
+        peak_r,
+    };
 
     // The variation fade has consumed its outgoing PCM: stage it for the
     // reclaim queue (drained at the top of every render — never dropped on
