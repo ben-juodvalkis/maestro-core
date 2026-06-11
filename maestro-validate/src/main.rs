@@ -99,8 +99,20 @@ mod thresholds {
     pub const MEMORY_PCM_BUDGET_BYTES: u64 = 96 * 1024 * 1024;
     /// VALIDATION-THRESHOLD (C2): "no audio gap on the playing stems" — every
     /// window of this length must keep an RMS floor on the sustained stem.
+    /// The floor detects ENGINE silence, not quiet music: a real gap (DSP
+    /// skip / botched swap) contributes exact zeros to the mixed bus and
+    /// measures ~1e-6 in the capture (converter/dither floor), while the
+    /// quietest musical moment of the Lagos pad measured 2.75e-3 on the
+    /// first C2 device capture (2026-06-10-1930). 1e-4 (−80 dBFS) separates
+    /// the classes by ~30 dB on both sides. (Initial a-priori value 3e-3
+    /// mis-flagged quiet content — recalibrated against the real capture,
+    /// ADR-092 §5.)
     pub const GAP_WINDOW_SECONDS: f64 = 0.5;
-    pub const GAP_RMS_FLOOR: f64 = 0.003;
+    pub const GAP_RMS_FLOOR: f64 = 1e-4;
+    /// VALIDATION-THRESHOLD (C2): anti-stub presence floor for the rhythmic
+    /// stem over the whole capture (measured 0.12 on device; an order of
+    /// magnitude of margin).
+    pub const STEM_PRESENT_RMS_FLOOR: f64 = 0.01;
 }
 
 #[derive(Serialize)]
@@ -1408,8 +1420,8 @@ fn analyze_memory(
         .sqrt();
     gate(
         "rhythmic-stem-present",
-        r_rms > thresholds::GAP_RMS_FLOOR,
-        format!("stem R overall RMS {r_rms:.5} (floor {})", thresholds::GAP_RMS_FLOOR),
+        r_rms > thresholds::STEM_PRESENT_RMS_FLOOR,
+        format!("stem R overall RMS {r_rms:.5} (floor {})", thresholds::STEM_PRESENT_RMS_FLOOR),
     );
     report.analyzed_pairs = 0;
 }
