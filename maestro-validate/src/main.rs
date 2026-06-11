@@ -68,6 +68,23 @@ mod thresholds {
     /// VALIDATION-THRESHOLD (C1): re-entry equality — stem B's median offset
     /// after restart (across the tempo change) vs before its stop.
     pub const RE_ENTRY_STEP_MAX: i64 = 96;
+    /// VALIDATION-THRESHOLD (C3, ADR-093): the stretch path's deterministic
+    /// pre-roll — Signalsmith preset_default output latency at 48 kHz (spec
+    /// §2.3#4; the dossier-verified 2880/2880 instance latency). Bypass
+    /// audio lands exactly on the derived grid; stretched audio lands this
+    /// CONSTANT late (spec §6.3(b) explicitly permits the stretch path "a
+    /// constant measured offset"). It is invisible to every cross-stem gate
+    /// (all stems of a song share O, so they cross the unity boundary
+    /// together — measured +0 samples cross-stem on the C3 UI capture) and
+    /// to the per-capture alignment constant. It becomes observable exactly
+    /// once: when a tempo change crosses the unity boundary, a stem's median
+    /// offset must step by THIS value — not 0, and not anything else (a
+    /// stale re-anchor still measures ~1.2k, outside 2880 ±
+    /// TEMPO_CHANGE_STEP_MAX, so the D7 negative control still fails).
+    /// Engine-side pre-roll compensation is filed as follow-up (it matters
+    /// for cross-song ghost stems, which can be stretched while host stems
+    /// run unity).
+    pub const STRETCH_PATH_PREROLL: i64 = 2880;
     /// VALIDATION-THRESHOLD (C1): minimum onsets per analysis window
     /// (pre/post-change, pre-stop/post-restart).
     pub const MIN_WINDOW_ONSETS: usize = 12;
@@ -370,14 +387,41 @@ fn zero_accumulation(w: &Window) -> (bool, String) {
             );
         }
     }
+    if w.slope.abs() < thresholds::ZERO_SLOPE_PER_ONSET_MAX {
+        return (
+            true,
+            format!(
+                "aperiodic within period ≤ {}; LS slope {:.6} samples/onset over {} onsets (gate < {})",
+                thresholds::ONSET_PATTERN_PERIOD_MAX,
+                w.slope,
+                w.offsets.len(),
+                thresholds::ZERO_SLOPE_PER_ONSET_MAX
+            ),
+        );
+    }
+    // Aperiodic AND slope over gate: the LS fit is only valid when the
+    // vocoder's jitter pattern repeats inside the window. At tempo ratios
+    // like 40/39 (120→117, the UI tempo button's single step) the pattern
+    // period is ~39 beats — longer than any window can repeat twice — and
+    // the fit aliases the sawtooth (C3: measured spurious slopes ±0.06–0.16
+    // on captures whose offset SPREAD was ≤ 31 samples, ADR-093). The
+    // spread bound is the sharper instrument there: in-window accumulation
+    // can never exceed the spread, so a window whose spread stays within
+    // the step-threshold class has zero accumulation at the same 96-sample
+    // granularity every boundary gate uses. Not a loosening: the historic
+    // drift class (0.04 samples/onset, spec A.1) accumulates ~1–2 samples
+    // per window — invisible to ANY per-window fit — and is caught by the
+    // full-capture gates (exact counts, cross-window medians).
+    let spread_bounded = w.spread <= thresholds::TEMPO_CHANGE_STEP_MAX;
     (
-        w.slope.abs() < thresholds::ZERO_SLOPE_PER_ONSET_MAX,
+        spread_bounded,
         format!(
-            "aperiodic within period ≤ {}; LS slope {:.6} samples/onset over {} onsets (gate < {})",
+            "aperiodic within period ≤ {} and LS slope {:.6}/onset over {} onsets is fit-aliased;              accumulation bounded by window spread {} (gate ≤ {})",
             thresholds::ONSET_PATTERN_PERIOD_MAX,
             w.slope,
             w.offsets.len(),
-            thresholds::ZERO_SLOPE_PER_ONSET_MAX
+            w.spread,
+            thresholds::TEMPO_CHANGE_STEP_MAX
         ),
     )
 }
@@ -397,6 +441,14 @@ fn main() -> ExitCode {
         .parse()
         .expect("--tempo-mbpm must be an integer (milli-BPM)");
     let harness_report = arg(&args, "--harness-report");
+    // C3 (ADR-093): the stems' original tempo, when the capture comes from a
+    // library song (real-UI runs). Lets the timing analysis know whether a
+    // tempo change crosses the UNITY boundary — bypass sits exactly on the
+    // grid, stretch sits a deterministic pre-roll late (spec §6.3(b)), so
+    // the expected step across such a change is STRETCH_PATH_PREROLL, not 0.
+    // Absent for harness runs (cross-tempo stems never run unity): steps 0.
+    let stem_tempo_mbpm: Option<u64> =
+        arg(&args, "--stem-tempo-mbpm").map(|v| v.parse().expect("--stem-tempo-mbpm must be an integer (milli-BPM)"));
     let report_out = arg(&args, "--report");
     // Negative-control mode (§6.4): the analysis must FAIL for the run to pass.
     let expect_fail = args.iter().any(|a| a == "--expect-fail");
@@ -448,7 +500,7 @@ fn main() -> ExitCode {
                     return ExitCode::from(2);
                 }
             };
-            analyze_timing(&wav, &log, &mut gate, &mut report);
+            analyze_timing(&wav, &log, stem_tempo_mbpm, &mut gate, &mut report);
         }
         "control" => {
             let hr = harness_json.as_ref().expect("--harness-report is required for control");
@@ -727,6 +779,7 @@ fn analyze_offset_pairs(
 fn analyze_timing(
     wav: &maestro_core::validation::LoadedWav,
     log: &CommandLog,
+    stem_tempo_mbpm: Option<u64>,
     gate: &mut impl FnMut(&str, bool, String),
     report: &mut Report,
 ) {
@@ -847,13 +900,26 @@ fn analyze_timing(
         let (ok, detail) = zero_accumulation(w);
         gate(name, ok, detail);
     }
-    // Offset before == offset after the tempo change (C1).
+    // Offset before == offset after the tempo change (C1) — except when the
+    // change crosses the UNITY boundary (C3, ADR-093): bypass lands exactly
+    // on the grid, stretch lands the deterministic pre-roll late (spec
+    // §6.3(b)), so the EXPECTED step is ±STRETCH_PATH_PREROLL there. This is
+    // an exact additional expectation, not a loosening: a stale re-anchor
+    // (~1.2k) is outside both windows and still fails.
+    let expected_flip_step = |mbpm_before: u64, mbpm_after: u64| -> i64 {
+        match stem_tempo_mbpm {
+            Some(o) if o == mbpm_before && o != mbpm_after => thresholds::STRETCH_PATH_PREROLL,
+            Some(o) if o != mbpm_before && o == mbpm_after => -thresholds::STRETCH_PATH_PREROLL,
+            _ => 0,
+        }
+    };
+    let a_expected = expected_flip_step(log.segments[0].1, log.segments[1].1);
     let a_step = a_mid.median - a_pre.median;
     gate(
         "a-offset-equal-across-change",
-        a_step.abs() <= thresholds::TEMPO_CHANGE_STEP_MAX,
+        (a_step - a_expected).abs() <= thresholds::TEMPO_CHANGE_STEP_MAX,
         format!(
-            "stem A median offset: pre {} vs post {} (step {a_step}, gate ≤ {})",
+            "stem A median offset: pre {} vs post {} (step {a_step}, expected {a_expected} ± {})",
             a_pre.median, a_mid.median, thresholds::TEMPO_CHANGE_STEP_MAX
         ),
     );
@@ -943,12 +1009,13 @@ fn analyze_timing(
     // Re-entry equality (C1): same constant before the stop and after the
     // restart, across the tempo change that happened while B was silent —
     // the exact class of re-anchoring bug that sank the previous attempt.
+    let b_expected = expected_flip_step(log.segments[0].1, log.segments[1].1);
     let b_step = b_post.median - b_pre.median;
     gate(
         "b-re-entry-equality",
-        b_step.abs() <= thresholds::RE_ENTRY_STEP_MAX,
+        (b_step - b_expected).abs() <= thresholds::RE_ENTRY_STEP_MAX,
         format!(
-            "stem B median offset: pre-stop {} vs post-restart {} (step {b_step}, gate ≤ {})",
+            "stem B median offset: pre-stop {} vs post-restart {} (step {b_step}, expected {b_expected} ± {})",
             b_pre.median, b_post.median, thresholds::RE_ENTRY_STEP_MAX
         ),
     );
