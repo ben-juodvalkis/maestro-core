@@ -10,9 +10,9 @@ name = "maestro_core"
 crate-type = ["lib", "cdylib", "staticlib"]
 
 [dependencies]
-# Step 8: Signalsmith Stretch — native C++ time-stretching and pitch-shifting
-# Feature-gated: only compiled for native targets (not WASM — web uses existing JS/WASM pipeline)
-# Uses colinmarc's crate: bindgen + cc compiles the C++ header-only library
+# Signalsmith Stretch — the C++ time-stretcher (colinmarc's crate: bindgen +
+# cc). Patched to the vendored fork (workspace [patch.crates-io]) which also
+# compiles the SAME C++ for wasm32 targets via wasi-sdk (M4, spec §3.8).
 signalsmith-stretch = { version = "0.1", optional = true }
 
 # UniFFI — the native six-function transport (spec §3.6). Native targets only.
@@ -24,11 +24,11 @@ rtrb = "0.3"
 # The one API schema (spec §3.6): Command / Event / Snapshot / Config.
 maestro-api = { path = "../maestro-api" }
 
-# Step 9: WASM exports via wasm-bindgen
-# Feature-gated: only compiled for wasm32 targets
+# WASM exports via wasm-bindgen — the six-function transport (spec §3.6, M4).
+# Feature-gated: only compiled for wasm32 targets.
 wasm-bindgen = { version = "0.2", optional = true }
-js-sys = { version = "0.3", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
+# (js-sys removed at M4 — the six-function transport needs no direct JS API.)
 serde_json = { version = "1", optional = true }
 
 
@@ -47,9 +47,13 @@ symphonia = { version = "0.5", default-features = false, features = ["aac", "iso
 
 [features]
 default = ["native-stretch"]
-native-stretch = ["signalsmith-stretch"]  # Step 8: native C++ time-stretching
+# The Signalsmith C++ stretcher — despite the name it builds for native AND
+# wasm32 targets (the vendored crate compiles the same C++ via wasi-sdk; M4,
+# spec §3.8). The engine planes (audio_core/control_plane) require it.
+native-stretch = ["signalsmith-stretch"]
 json = ["serde", "serde_json"]            # JSON serialization for complex types
-wasm = ["wasm-bindgen", "js-sys", "json"] # Step 9: wasm-bindgen exports (includes json)
+# The six-function wasm transport (spec §3.6, M4) for the AudioWorklet module.
+wasm = ["wasm-bindgen", "json", "native-stretch"]
 uniffi-bindings = ["uniffi", "json", "native-stretch"] # native transport (spec §3.6)
 # Sabotage modes for T-INV negative controls (spec §6.2): float_cursor,
 # pcm_length_loop, timer_clock. CI builds with this feature and asserts the

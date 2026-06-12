@@ -1,0 +1,10 @@
+# Native audio rebuild M4 (spec §3.8 / §6.6): the offline validation suites
+# run compiled to wasm32 under wasmtime — same integer position math as the
+# shipping wasm32-unknown-unknown AudioWorklet module, with std (clocks,
+# files) available so T-INV/T-SEAM/T-CTRL run UNMODIFIED.
+#
+# `--dir /::/` preopens the host filesystem at the guest root so the
+# fixture paths baked in via env!("CARGO_MANIFEST_DIR") resolve. `-S
+# inherit-env` is not needed — the suites read no env at runtime.
+[target.wasm32-wasip1]
+runner = ["wasmtime", "run", "--dir", "/::/", "--"]

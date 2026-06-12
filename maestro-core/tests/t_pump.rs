@@ -10,6 +10,10 @@
 //!   when the producer keeps up (occupancy pacing works);
 //! - the callback-side `maestro_pump_consume` is allocation-free.
 
+// Plan B is iOS delivery (ADR-090); the web engine renders directly in the
+// worklet quantum and render_pump is not compiled for wasm32 (spec §3.8).
+#![cfg(not(target_arch = "wasm32"))]
+
 mod common;
 
 use assert_no_alloc::{assert_no_alloc, AllocDisabler};

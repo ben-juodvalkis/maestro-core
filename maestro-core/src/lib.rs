@@ -23,17 +23,26 @@ pub mod timeline;
 pub mod seqlock;
 
 // The two engine planes (spec §3.3). Audio core renders inside the OS audio
-// callback; control plane validates/prepares on the caller's thread. Both
-// need the native Signalsmith stretcher; the WASM build (M4) compiles the
-// same C++ in via Emscripten and lifts this gate.
+// callback (or the AudioWorklet quantum on web, M4); control plane validates
+// and prepares on the caller's thread. Both need the Signalsmith C++
+// stretcher — `native-stretch` now builds it for native AND wasm32 targets
+// (the vendored crate compiles the same C++ via wasi-sdk, spec §3.8).
 #[cfg(feature = "native-stretch")]
 pub mod audio_core;
 #[cfg(feature = "native-stretch")]
 pub mod control_plane;
 
 // Plan B delivery (spec §3.3): dedicated producer thread + SPSC sample ring.
-#[cfg(feature = "native-stretch")]
+// iOS-only delivery (ADR-090); never compiled for wasm32 — the web engine
+// renders directly in `AudioWorkletProcessor.process()` (spec §3.8, no
+// render pump on web) and wasm32 has no std::thread to pump with.
+#[cfg(all(feature = "native-stretch", not(target_arch = "wasm32")))]
 pub mod render_pump;
+
+// C runtime shims (malloc/free, libm) for the wasm32-unknown-unknown
+// shipping module — the Signalsmith C++'s libc needs (M4, spec §3.8).
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+pub mod wasm_runtime;
 
 // T-INV negative-control sabotage modes (spec §6.2). Test builds only.
 #[cfg(feature = "drift-injection")]

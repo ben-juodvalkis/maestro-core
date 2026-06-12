@@ -234,18 +234,21 @@ impl ControlPlane {
                         }
                     }
                 }
+                if let Err(reason) = self.send(RtCommand::SetTempo { mbpm: *mbpm }) {
+                    return CommandResult::Rejected { reason };
+                }
+                // Mirror reflects only commands actually issued.
                 self.tempo_mbpm = *mbpm;
-                self.send(RtCommand::SetTempo { mbpm: *mbpm });
             }
-            Command::Play => self.send(RtCommand::Play),
-            Command::Stop => self.send(RtCommand::Stop),
-            Command::Pause => self.send(RtCommand::Pause),
-            Command::Resume => self.send(RtCommand::Resume),
+            Command::Play => return self.send_cmd(RtCommand::Play),
+            Command::Stop => return self.send_cmd(RtCommand::Stop),
+            Command::Pause => return self.send_cmd(RtCommand::Pause),
+            Command::Resume => return self.send_cmd(RtCommand::Resume),
             Command::Activate { slot, quantize, transport } => {
                 if let Err(r) = self.expect_loaded(*slot) {
                     return r;
                 }
-                self.send(RtCommand::Activate {
+                return self.send_cmd(RtCommand::Activate {
                     slot: *slot,
                     quantize: *quantize,
                     auto_start: *transport == TransportPolicy::Auto,
@@ -255,7 +258,7 @@ impl ControlPlane {
                 if let Err(r) = self.expect_loaded(*slot) {
                     return r;
                 }
-                self.send(RtCommand::Deactivate {
+                return self.send_cmd(RtCommand::Deactivate {
                     slot: *slot,
                     auto_stop: *transport == TransportPolicy::Auto,
                 });
@@ -264,10 +267,12 @@ impl ControlPlane {
                 if let Err(r) = self.expect_loaded(*slot) {
                     return r;
                 }
+                if let Err(reason) = self.send(RtCommand::RemoveTrack { slot: *slot }) {
+                    return CommandResult::Rejected { reason };
+                }
                 // Frees the slot mirror AND its §4.11 variation cache; the
                 // audio core hands its TrackState back via the reclaim queue.
                 self.slots[*slot as usize] = SlotState::Empty;
-                self.send(RtCommand::RemoveTrack { slot: *slot });
             }
             Command::SetGain { slot, gain } => {
                 if let Err(r) = self.expect_loaded(*slot) {
@@ -276,7 +281,7 @@ impl ControlPlane {
                 if let Err(reason) = validate_gain(*gain) {
                     return CommandResult::Rejected { reason };
                 }
-                self.send(RtCommand::SetGain { slot: *slot, gain: *gain });
+                return self.send_cmd(RtCommand::SetGain { slot: *slot, gain: *gain });
             }
             Command::SetPan { slot, pan } => {
                 if let Err(r) = self.expect_loaded(*slot) {
@@ -285,19 +290,19 @@ impl ControlPlane {
                 if let Err(reason) = validate_pan(*pan) {
                     return CommandResult::Rejected { reason };
                 }
-                self.send(RtCommand::SetPan { slot: *slot, pan: *pan });
+                return self.send_cmd(RtCommand::SetPan { slot: *slot, pan: *pan });
             }
             Command::SetMute { slot, muted } => {
                 if let Err(r) = self.expect_loaded(*slot) {
                     return r;
                 }
-                self.send(RtCommand::SetMute { slot: *slot, muted: *muted });
+                return self.send_cmd(RtCommand::SetMute { slot: *slot, muted: *muted });
             }
             Command::SetSolo { slot, solo } => {
                 if let Err(r) = self.expect_loaded(*slot) {
                     return r;
                 }
-                self.send(RtCommand::SetSolo { slot: *slot, solo: *solo });
+                return self.send_cmd(RtCommand::SetSolo { slot: *slot, solo: *solo });
             }
             Command::SetPitch { slot, semitones } => {
                 if let Err(r) = self.expect_loaded(*slot) {
@@ -311,7 +316,7 @@ impl ControlPlane {
                         ),
                     };
                 }
-                self.send(RtCommand::SetPitch { slot: *slot, semitones: *semitones });
+                return self.send_cmd(RtCommand::SetPitch { slot: *slot, semitones: *semitones });
             }
             Command::SwitchVariation { slot, variation } => {
                 return self.switch_variation(*slot, *variation);
@@ -333,16 +338,31 @@ impl ControlPlane {
             return CommandResult::Ok; // already current — no-op
         }
         if let Some(idx) = l.cached.iter().position(|(v, _, _)| *v == variation) {
-            let (_, pcm, _) = l.cached.swap_remove(idx);
-            let outgoing = (l.variation, Arc::clone(&l.current_pcm));
-            l.current_pcm = Arc::clone(&pcm);
-            l.variation = variation;
-            l.pending_variation = None;
+            // Send first, mutate the control-side mirror only on success —
+            // a rejected send (wasm full-queue case) must leave the mirror
+            // consistent with what the audio core actually received.
+            let pcm = Arc::clone(&l.cached[idx].1);
+            if let Err(reason) = self.send(RtCommand::SwapVariation {
+                slot,
+                variation,
+                pcm: Arc::clone(&pcm),
+            }) {
+                return CommandResult::Rejected { reason };
+            }
             self.lru_clock += 1;
             let stamp = self.lru_clock;
             let SlotState::Loaded(l) = &mut self.slots[slot as usize] else { unreachable!() };
+            let idx = l
+                .cached
+                .iter()
+                .position(|(v, _, _)| *v == variation)
+                .expect("cached entry still present");
+            l.cached.swap_remove(idx);
+            let outgoing = (l.variation, Arc::clone(&l.current_pcm));
+            l.current_pcm = pcm;
+            l.variation = variation;
+            l.pending_variation = None;
             l.cached.push((outgoing.0, outgoing.1, stamp));
-            self.send(RtCommand::SwapVariation { slot, variation, pcm });
             self.enforce_pcm_budget();
         } else {
             l.pending_variation = Some(variation);
@@ -508,6 +528,13 @@ impl ControlPlane {
                         meta.variation, meta.slot, reconciliation, l.reconciliation,
                     ));
                 }
+                // Send first; the mirror mutates only on success (see
+                // switch_variation).
+                self.send(RtCommand::SwapVariation {
+                    slot: meta.slot,
+                    variation: meta.variation,
+                    pcm: Arc::clone(&pcm),
+                })?;
                 self.lru_clock += 1;
                 let stamp = self.lru_clock;
                 let SlotState::Loaded(l) = &mut self.slots[meta.slot as usize] else {
@@ -518,16 +545,11 @@ impl ControlPlane {
                 let outgoing = (l.variation, Arc::clone(&l.current_pcm), stamp);
                 l.cached.retain(|(v, _, _)| *v != outgoing.0 && *v != meta.variation);
                 l.cached.push(outgoing);
-                l.current_pcm = Arc::clone(&pcm);
+                l.current_pcm = pcm;
                 l.variation = meta.variation;
                 if l.pending_variation == Some(meta.variation) {
                     l.pending_variation = None;
                 }
-                self.send(RtCommand::SwapVariation {
-                    slot: meta.slot,
-                    variation: meta.variation,
-                    pcm,
-                });
                 self.enforce_pcm_budget();
                 return Ok(reconciliation);
             }
@@ -554,7 +576,7 @@ impl ControlPlane {
             stretcher,
         ));
 
-        self.send(RtCommand::InstallTrack { slot: meta.slot, state });
+        self.send(RtCommand::InstallTrack { slot: meta.slot, state })?;
         self.slots[meta.slot as usize] = SlotState::Loaded(Box::new(LoadedSlot {
             o_mbpm: meta.original_tempo_mbpm,
             loop_beats: meta.loop_beats,
@@ -681,18 +703,45 @@ impl ControlPlane {
         }
     }
 
-    /// Enqueue, blocking this (non-audio) thread if the queue is full
-    /// (spec §3.3) — the audio thread drains at every block boundary.
-    fn send(&mut self, cmd: RtCommand) {
-        let mut cmd = cmd;
-        loop {
-            match self.commands.push(cmd) {
-                Ok(()) => return,
-                Err(rtrb::PushError::Full(returned)) => {
-                    cmd = returned;
-                    std::thread::yield_now();
+    /// Enqueue an RT command. On native targets the control plane blocks its
+    /// own (non-audio) thread if the queue is full (spec §3.3) — the audio
+    /// thread drains at every block boundary. On `wasm32-unknown-unknown`
+    /// the control plane and the renderer share the ONE worklet thread, so
+    /// blocking would deadlock the audio thread: a full queue rejects the
+    /// command instead — loudly, never silently (the §3.3 blocking choice
+    /// presumed a second thread; ADR-095). 256 pending commands without a
+    /// render in between only happens when the AudioContext is not running.
+    fn send(&mut self, cmd: RtCommand) -> Result<(), String> {
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        {
+            self.commands.push(cmd).map_err(|_| {
+                format!(
+                    "RT command queue full ({COMMAND_QUEUE_CAPACITY} pending) — the worklet \
+                     render is not draining (suspended AudioContext?); command rejected \
+                     rather than deadlocking the audio thread (ADR-095)"
+                )
+            })
+        }
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        {
+            let mut cmd = cmd;
+            loop {
+                match self.commands.push(cmd) {
+                    Ok(()) => return Ok(()),
+                    Err(rtrb::PushError::Full(returned)) => {
+                        cmd = returned;
+                        std::thread::yield_now();
+                    }
                 }
             }
+        }
+    }
+
+    /// `send` shaped as a `CommandResult` for the `dispatch` arms.
+    fn send_cmd(&mut self, cmd: RtCommand) -> CommandResult {
+        match self.send(cmd) {
+            Ok(()) => CommandResult::Ok,
+            Err(reason) => CommandResult::Rejected { reason },
         }
     }
 }

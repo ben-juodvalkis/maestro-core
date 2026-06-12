@@ -5,6 +5,14 @@ members = ["maestro-core", "maestro-api", "maestro-validate"]
 # tree (clap et al.) out of the workspace graph. Built by build-ios.sh.
 exclude = ["maestro-core/uniffi-bindgen"]
 
+# M4 (spec §3.8): the SAME Signalsmith C++ must compile INTO the maestro-core
+# WASM module. The vendored fork only adds wasm32 support to build.rs
+# (wasi-sdk clang++ + runtime shims); native builds are byte-identical to the
+# registry crate. See maestro-core/vendor/signalsmith-stretch/Cargo.toml for
+# provenance.
+[patch.crates-io]
+signalsmith-stretch = { path = "maestro-core/vendor/signalsmith-stretch" }
+
 # Workspace-wide profiles (member-level profile sections are ignored by Cargo).
 [profile.release]
 opt-level = 3

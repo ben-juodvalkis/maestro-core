@@ -33,6 +33,7 @@
 #![allow(clippy::too_many_arguments)]
 
 use std::sync::Arc;
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 use std::time::Instant;
 
 use maestro_api::QuantizePolicy;
@@ -120,6 +121,40 @@ pub enum RtEvent {
     VariationApplied { slot: u8, variation: u8, at_frame: u64 },
     LoopWrapped { slot: u8, wrap_count: u32 },
     BudgetExceeded { render_ns: u64, period_ns: u64 },
+}
+
+/// Monotonic render-budget clock (spec §3.3 — the audio thread times itself).
+/// `std::time::Instant` unconditionally panics on `wasm32-unknown-unknown`
+/// (the target has no clock); the AudioWorklet quantum also has no OS
+/// callback period to gate against, so budget telemetry reports zeros on the
+/// web module (ADR-095) — the C4 web gates are the offline suites + parity +
+/// E2E, never render-time telemetry. Every other target keeps real timing.
+struct RenderClock(#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))] Instant);
+
+impl RenderClock {
+    #[inline]
+    fn start() -> Self {
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        {
+            Self(Instant::now())
+        }
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        {
+            Self()
+        }
+    }
+
+    #[inline]
+    fn elapsed_ns(&self) -> u64 {
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        {
+            self.0.elapsed().as_nanos() as u64
+        }
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        {
+            0
+        }
+    }
 }
 
 /// Push an edge event, counting the drop if the queue is full (spec §6.7 —
@@ -494,7 +529,7 @@ impl AudioCore {
     pub fn render(&mut self, left: &mut [f32], right: &mut [f32]) {
         debug_assert_eq!(left.len(), right.len());
         let b = left.len().min(right.len()).min(MAX_BLOCK_FRAMES);
-        let t0 = Instant::now();
+        let t0 = RenderClock::start();
         left.fill(0.0);
         right.fill(0.0);
         if b == 0 {
@@ -622,7 +657,7 @@ impl AudioCore {
 
         // Budget telemetry (spec §3.3): the audio thread times itself; reading
         // a timestamp is RT-safe.
-        let render_ns = t0.elapsed().as_nanos() as u64;
+        let render_ns = t0.elapsed_ns();
         let period_ns = b as u64 * 1_000_000_000 / crate::timeline::ENGINE_SAMPLE_RATE as u64;
         self.blocks_total += 1;
         self.render_ns_max = self.render_ns_max.max(render_ns);
