@@ -59,12 +59,21 @@ impl std::error::Error for EngineError {}
 /// load event and asserted stable across variations of a stem (spec §3.4#4):
 /// same decoder + same encoder must reconcile the same way — a flip means a
 /// mis-tagged or mis-decoded file, which is a hard failure, not a curiosity.
+///
+/// All three cases are EXACT integer equalities against the per-file
+/// MEASURED metadata — there are no heuristics, and anything else remains a
+/// hard `TrackLoadFailed` (spec §3.4#4; third case added at M4, ADR-095).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reconciliation {
     /// Decoded length == original_samples: decoder already applied gapless trim.
     AlreadyTrimmed,
     /// Decoded length == original + delay + padding: raw decode; we trim exactly.
     TrimmedHere,
+    /// Decoded length == original + end_padding: the decoder applied the
+    /// priming (encoder delay) but NOT the trailing padding — Chrome's
+    /// `decodeAudioData` behavior, found by this exact gate firing on the
+    /// first M4 in-app WASM run (ADR-095). We truncate exactly the padding.
+    TrimmedPadding,
 }
 
 impl Reconciliation {
@@ -72,6 +81,7 @@ impl Reconciliation {
         match self {
             Self::AlreadyTrimmed => "alreadyTrimmed",
             Self::TrimmedHere => "trimmedHere",
+            Self::TrimmedPadding => "trimmedPadding",
         }
     }
 }
@@ -457,7 +467,11 @@ impl ControlPlane {
         let l_dec = left.len() as u64;
 
         // §3.4#4 decoder-agnostic length reconciliation — the double-trim killer.
+        // Three EXACT cases (ADR-095 added the third); anything else fails.
+        // Where the metadata makes cases coincide (delay or padding of 0)
+        // the trims coincide too — order cannot change the outcome.
         let raw_len = meta.original_samples + meta.encoder_delay as u64 + meta.end_padding as u64;
+        let padded_len = meta.original_samples + meta.end_padding as u64;
         let reconciliation = if l_dec == meta.original_samples {
             Reconciliation::AlreadyTrimmed
         } else if l_dec == raw_len {
@@ -468,10 +482,16 @@ impl ControlPlane {
             right.drain(..delay);
             right.truncate(orig);
             Reconciliation::TrimmedHere
+        } else if l_dec == padded_len {
+            let orig = meta.original_samples as usize;
+            left.truncate(orig);
+            right.truncate(orig);
+            Reconciliation::TrimmedPadding
         } else {
             return Err(format!(
-                "length mismatch: decoded {l_dec}, expected {} (already-trimmed) or {raw_len} \
-                 (raw decode) — no heuristics, load fails (spec §3.4)",
+                "length mismatch: decoded {l_dec}, expected {} (already-trimmed), {raw_len} \
+                 (raw decode), or {padded_len} (delay-only trim) — no heuristics, load fails \
+                 (spec §3.4)",
                 meta.original_samples
             ));
         };

@@ -13,7 +13,10 @@
 //! 2. decoder-pre-trimmed (simulated by length) → `AlreadyTrimmed`;
 //! 3. raw decode (+delay+padding length) → `TrimmedHere`, with the trim
 //!    WINDOW (not just the length) verified bit-exact through the render path;
-//! 4. wrong-length file → `TrackLoadFailed` naming both expected lengths;
+//! 3b. delay-only trim (+padding length) → `TrimmedPadding` — Chrome's
+//!    `decodeAudioData` behavior, found by the gate firing on the first M4
+//!    in-app WASM run (ADR-095); same bit-exact window verification;
+//! 4. wrong-length file → `TrackLoadFailed` naming every expected length;
 //! 5. variation set with one mismatched length → hard identity failure;
 //! 6. non-48k file → hard failure (the engine never resamples).
 //!
@@ -268,6 +271,53 @@ fn raw_length_trims_exactly_the_measured_window() {
     drop(plane);
 }
 
+#[test]
+fn padded_length_trims_exactly_the_end_padding() {
+    // Chrome's decodeAudioData: priming stripped, end padding left in place
+    // (decoded == original + end_padding). Found in production geometry by
+    // the §3.4#4 gate itself on the first in-app M4 WASM run (ADR-095): the
+    // Metronome Test default decoded 384960 = 384000 + 960. Same anti-stub
+    // shape as the raw-length case: ramp content, bit-exact window through
+    // the unity bypass — sample k of the loop must be ramp[k] (NO delay
+    // offset; the decoder already removed it).
+    let (mut plane, mut core) = engine();
+    let padded_len = M4A_ORIGINAL_SAMPLES + M4A_END_PADDING as u64;
+    let ramp: Vec<f32> = (0..padded_len).map(|i| (i % 9601) as f32 / 96_000.0).collect();
+    let mut m = meta(0, 0, M4A_ORIGINAL_SAMPLES);
+    m.original_tempo_mbpm = 120_000; // unity at the engine tempo → bypass
+    m.loop_beats = 32; // 32 beats @ 120 = 768_000 exactly
+    let rec = plane.load_pcm(&m, ramp.clone(), ramp.clone()).expect("padded-length loads");
+    assert_eq!(rec, Reconciliation::TrimmedPadding);
+
+    assert!(matches!(
+        plane.dispatch(Command::Activate {
+            slot: 0,
+            quantize: QuantizePolicy::Immediate,
+            transport: Default::default()
+        }),
+        CommandResult::Ok
+    ));
+    assert!(matches!(plane.dispatch(Command::Play), CommandResult::Ok));
+    let mut left = vec![0.0f32; 480];
+    let mut right = vec![0.0f32; 480];
+    core.render(&mut left, &mut right); // applies commands; first audible block
+    for _ in 0..10 {
+        core.render(&mut left, &mut right);
+    }
+    let gl = (std::f32::consts::FRAC_PI_4).cos(); // pan 0, gain 1
+    let n0 = 10 * 480u64;
+    for i in 0..480usize {
+        let src = ramp[(n0 + i as u64) as usize];
+        assert_eq!(
+            left[i].to_bits(),
+            (src * gl).to_bits(),
+            "padding-only trim window wrong at loop sample {} — §3.4 demands the exact span",
+            n0 + i as u64
+        );
+    }
+    drop(plane);
+}
+
 // ---------------------------------------------------------------------------
 // 4./5./6. The negative controls (spec §6.1: assertions must be able to fail).
 // ---------------------------------------------------------------------------
@@ -288,6 +338,11 @@ fn wrong_length_fails_with_both_expected_lengths_named() {
 
     // One sample off fails too — no heuristic pad/trim anywhere.
     let (l, r) = make_sine_pcm(M4A_ORIGINAL_SAMPLES + 1, 220.0);
+    assert!(plane.load_pcm(&meta(0, 0, M4A_ORIGINAL_SAMPLES), l, r).is_err());
+
+    // One sample past the delay-only-trim case (ADR-095) fails identically —
+    // the third case is an exact equality, not a tolerance.
+    let (l, r) = make_sine_pcm(M4A_ORIGINAL_SAMPLES + M4A_END_PADDING as u64 + 1, 220.0);
     assert!(plane.load_pcm(&meta(0, 0, M4A_ORIGINAL_SAMPLES), l, r).is_err());
 }
 
