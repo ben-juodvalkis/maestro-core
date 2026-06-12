@@ -1397,11 +1397,20 @@ fn render_track(
     }
     ts.ramp_remaining = ramp_remaining;
     ts.applied_mix = Some((gl1, gr1));
+    // Meter ballistics (ADR-095, display only — floats never feed timing):
+    // attack instant, release −20 dB per 300 ms. A raw per-block value is a
+    // 2.67 ms sample that a 15–30 Hz snapshot poll aliases straight past
+    // (the M4 web E2E read near-zero meters on demonstrably loud content —
+    // peaks BETWEEN polls are unrecoverable downstream, so the hold lives
+    // here where every block is seen). Steady-state values are identical to
+    // the previous per-block definition (max with a decayed copy), and the
+    // DSP-skip path still zeroes instantly.
+    let decay = 10f32.powf(-(b as f32) / 14_400.0); // 20 dB / (0.3 s · 48 kHz)
     ts.meter = TrackMeter {
-        rms_l: (sumsq_l * inv_b).sqrt(),
-        rms_r: (sumsq_r * inv_b).sqrt(),
-        peak_l,
-        peak_r,
+        rms_l: (sumsq_l * inv_b).sqrt().max(ts.meter.rms_l * decay),
+        rms_r: (sumsq_r * inv_b).sqrt().max(ts.meter.rms_r * decay),
+        peak_l: peak_l.max(ts.meter.peak_l * decay),
+        peak_r: peak_r.max(ts.meter.peak_r * decay),
     };
 
     // The variation fade has consumed its outgoing PCM: stage it for the
