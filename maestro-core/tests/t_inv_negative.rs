@@ -115,4 +115,26 @@ fn t_inv_detects_all_sabotage_modes() {
     let clean_m1 =
         run_scripted_scenario(frames, TEMPO, 1_000_000, &[0, 1, 2, 3], &m1_negative_script());
     assert_eq!(clean_m1.position_mismatches, 0, "clean M1-legs run must be drift-free");
+
+    // Parity-lane negative control (spec §6.6 / §6.1, M4): the cross-platform
+    // position digest must MOVE under drift. The CI parity lane compares
+    // digests byte-for-byte across x86 / arm64 / wasm32 — a digest that
+    // hashed something insensitive to the defect classes would wave a
+    // sabotaged build straight through that comparison. This runs on every
+    // lane, INCLUDING wasm32, so the wasm parity path itself is proven to
+    // fail on a drift-injection build.
+    set_mode(Sabotage::FloatCursor);
+    let sabotaged = run_t_inv_scenario(frames, TEMPO, 1_000_000);
+    set_mode(Sabotage::None);
+    assert_ne!(
+        clean.position_digest(),
+        sabotaged.position_digest(),
+        "the §6.6 parity digest did not change under float_cursor sabotage — \
+         the parity lane cannot detect drift and is broken"
+    );
+    println!(
+        "parity negative control: sabotaged digest {:#018x} != clean {:#018x}",
+        sabotaged.position_digest(),
+        clean.position_digest()
+    );
 }
