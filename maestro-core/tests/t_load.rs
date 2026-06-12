@@ -13,7 +13,7 @@
 //! 2. decoder-pre-trimmed (simulated by length) → `AlreadyTrimmed`;
 //! 3. raw decode (+delay+padding length) → `TrimmedHere`, with the trim
 //!    WINDOW (not just the length) verified bit-exact through the render path;
-//! 3b. delay-only trim (+padding length) → `TrimmedPadding` — Chrome's
+//! 3. (b) delay-only trim (+padding length) → `TrimmedPadding` — Chrome's
 //!    `decodeAudioData` behavior, found by the gate firing on the first M4
 //!    in-app WASM run (ADR-095); same bit-exact window verification;
 //! 4. wrong-length file → `TrackLoadFailed` naming every expected length;
