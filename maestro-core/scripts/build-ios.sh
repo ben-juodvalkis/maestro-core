@@ -86,12 +86,40 @@ for H in "$DEVICE_HEADERS" "$SIM_HEADERS"; do
     sed -i '' 's|header "maestro_coreFFI.h"|header "maestro_coreFFI.h"\n    header "maestro_render.h"|' "$H/module.modulemap"
 done
 
+# D8 release-slice guard (spec §5 M5, ADR-096): a release packaging run must
+# contain no debug slice — the canary symbol exists only under
+# debug_assertions, so even a profile override (e.g. a stray
+# CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS) is caught here, not on a device
+# months later. Sabotage (drift-injection) slices stay legitimate for local
+# negative-control runs; the CI release pipeline rejects BOTH canaries
+# before publishing.
+if [ "$PROFILE_DIR" = "release" ]; then
+    for LIB in "$BUILD_DIR/aarch64-apple-ios/$PROFILE_DIR/libmaestro_core.a" \
+               "$BUILD_DIR/aarch64-apple-ios-sim/$PROFILE_DIR/libmaestro_core.a"; do
+        if nm "$LIB" 2>/dev/null | grep -q MAESTRO_DEBUG_BUILD_CANARY; then
+            echo "ERROR: $LIB contains MAESTRO_DEBUG_BUILD_CANARY — a debug slice in a"
+            echo "release packaging run (spec D8 / ADR-096). Check for profile overrides."
+            exit 1
+        fi
+    done
+fi
+
 xcodebuild -create-xcframework \
     -library "$BUILD_DIR/aarch64-apple-ios/$PROFILE_DIR/libmaestro_core.a" \
     -headers "$DEVICE_HEADERS" \
     -library "$BUILD_DIR/aarch64-apple-ios-sim/$PROFILE_DIR/libmaestro_core.a" \
     -headers "$SIM_HEADERS" \
     -output "$XCFRAMEWORK_PATH"
+
+# Provenance stamp (read back by the CI release pipeline and by humans
+# wondering what a device is running).
+cat > "$XCFRAMEWORK_PATH/BUILD_INFO" << INFO
+profile=$PROFILE_DIR
+features=$FEATURES
+git_rev=$(git -C "$REPO_DIR" rev-parse HEAD 2>/dev/null || echo unknown)
+rustc=$(rustc --version)
+built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+INFO
 
 echo "--- Step 5: Swift bindings → plugin sources ---"
 SWIFT_DEST="$PLUGIN_DIR/ios/Sources/MaestroAudioPlugin"

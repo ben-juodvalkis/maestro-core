@@ -536,3 +536,216 @@ fn write_control_stale_reanchor_capture() {
     render_control_scenario("control_stale_reanchor.wav", "control_stale_reanchor_report.json");
     maestro_core::sabotage::set_mode(maestro_core::sabotage::Sabotage::None);
 }
+
+// ---------------------------------------------------------------------------
+// C5 `soak` scenario (spec §5 M5, ADR-096), offline edition: two bounded
+// capture windows separated by an uncaptured fast-forward span, plus the
+// counter telemetry the device harness logs throughout (here: one line per
+// simulated 5 s, wall clock = engine time, so the frames-advance anti-stub
+// reads exactly 1.0). The §6.1 pairing for the soak analysis:
+//
+// - the CLEAN edition must PASS;
+// - the SILENT edition (stems loaded, never activated — F advances over
+//   silence) must FAIL (RMS floor + onset counts);
+// - the SABOTAGED edition (stretch_disabled) must FAIL (wrong-rate onsets);
+// - the LEAKY edition (clean audio, synthetic +30 MiB/h RSS ramp) must FAIL
+//   (proves the rss-slope gate's math the way ADR-092 proved the gap gate
+//   on a synthetically gapped capture — RSS itself is a device quantity).
+// ---------------------------------------------------------------------------
+
+/// Window/fast-forward sizes for the offline soak (real soak: 70 s windows,
+/// 4 h span — the analysis is identical, only durations differ).
+const SOAK_WINDOW_SECONDS: u64 = 70;
+const SOAK_FF_SECONDS: u64 = 240;
+const SOAK_TELEMETRY_PERIOD_S: u64 = 5;
+
+struct SoakEdition {
+    activate: bool,
+    rss_leak_bytes_per_hour: f64,
+    wav_start: &'static str,
+    wav_end: &'static str,
+    telemetry: &'static str,
+    report: &'static str,
+}
+
+fn render_soak_edition(ed: &SoakEdition) {
+    let (mut plane, mut core) = create_engine(EngineConfig {
+        sample_rate: SAMPLE_RATE,
+        initial_tempo_mbpm: TEMPO,
+        beats_per_bar: 4,
+    })
+    .unwrap();
+
+    let stems = [
+        Stem { fixture: "metronome_60.wav", o_mbpm: 60_000, pan: -1.0 },
+        Stem { fixture: "metronome_90.wav", o_mbpm: 90_000, pan: 1.0 },
+    ];
+    for (slot, stem) in stems.iter().enumerate() {
+        let wav = load_float_wav(&fixture_path(stem.fixture)).unwrap();
+        plane
+            .load_pcm(
+                &LoadMeta {
+                    sample_rate: 48_000,
+                    slot: slot as u8,
+                    original_tempo_mbpm: stem.o_mbpm,
+                    loop_beats: 16,
+                    encoder_delay: 0,
+                    end_padding: 0,
+                    original_samples: wav.frames as u64,
+                    variation: 0,
+                    gain: 1.0,
+                    pan: stem.pan,
+                },
+                wav.channels[0].clone(),
+                wav.channels[1].clone(),
+            )
+            .unwrap();
+        if ed.activate {
+            assert!(matches!(
+                plane.dispatch(Command::Activate {
+                    slot: slot as u8,
+                    quantize: maestro_api::QuantizePolicy::Immediate,
+                    transport: Default::default()
+                }),
+                CommandResult::Ok
+            ));
+        }
+    }
+    assert!(matches!(plane.dispatch(Command::Play), CommandResult::Ok));
+
+    let window = SOAK_WINDOW_SECONDS * SAMPLE_RATE as u64;
+    let ff = SOAK_FF_SECONDS * SAMPLE_RATE as u64;
+    let total = window + ff + window;
+    let telemetry_period = SOAK_TELEMETRY_PERIOD_S * SAMPLE_RATE as u64;
+
+    let mut start_l = Vec::with_capacity(window as usize);
+    let mut start_r = Vec::with_capacity(window as usize);
+    let mut end_l = Vec::with_capacity(window as usize);
+    let mut end_r = Vec::with_capacity(window as usize);
+    let mut l = vec![0.0f32; BLOCK];
+    let mut r = vec![0.0f32; BLOCK];
+    let mut rendered = 0u64;
+    let mut events = Vec::new();
+    let mut telemetry_lines: Vec<String> = Vec::new();
+    let mut next_telemetry = 0u64;
+
+    while rendered < total {
+        core.render(&mut l, &mut r);
+        if rendered < window {
+            start_l.extend_from_slice(&l);
+            start_r.extend_from_slice(&r);
+        } else if rendered >= window + ff {
+            end_l.extend_from_slice(&l);
+            end_r.extend_from_slice(&r);
+        }
+        rendered += BLOCK as u64;
+        events.extend(plane.drain_events());
+
+        if rendered >= next_telemetry {
+            // Simulated wall clock = engine time (the offline soak has no
+            // scheduler); the device harness stamps real wall time.
+            let t_ms = rendered as f64 / 48.0;
+            let snap = serde_json::to_value(plane.snapshot()).unwrap();
+            let rss = 100.0 * 1024.0 * 1024.0
+                + ed.rss_leak_bytes_per_hour * (t_ms / 3_600_000.0);
+            telemetry_lines.push(
+                serde_json::json!({
+                    "tMs": t_ms,
+                    "engineFrame": snap["engineFrame"],
+                    "underruns": snap["underruns"],
+                    "blocksTotal": snap["blocksTotal"],
+                    "blocksOverHalfPeriod": snap["blocksOverHalfPeriod"],
+                    "renderNsMax": snap["renderNsMax"],
+                    "callbackPeriodNs": snap["callbackPeriodNs"],
+                    "eventsDropped": snap["eventsDropped"],
+                    "pcmBytesInUse": snap["pcmBytesInUse"],
+                    "rssBytes": rss,
+                })
+                .to_string(),
+            );
+            next_telemetry += telemetry_period;
+        }
+    }
+
+    let snapshot = plane.snapshot();
+    events.extend(plane.drain_events());
+
+    let dir = out_dir();
+    write_float_wav_stereo(&dir.join(ed.wav_start), &start_l, &start_r, SAMPLE_RATE).unwrap();
+    write_float_wav_stereo(&dir.join(ed.wav_end), &end_l, &end_r, SAMPLE_RATE).unwrap();
+    std::fs::write(dir.join(ed.telemetry), telemetry_lines.join("\n")).unwrap();
+    let report = serde_json::json!({
+        "scenario": "soak",
+        "scenarioSeconds": total / SAMPLE_RATE as u64,
+        "finalSnapshot": snapshot,
+        "events": events,
+        "snapshots": [],
+    });
+    std::fs::write(dir.join(ed.report), serde_json::to_string_pretty(&report).unwrap()).unwrap();
+    println!("wrote soak edition: {} / {} / {}", ed.wav_start, ed.wav_end, ed.telemetry);
+}
+
+#[test]
+fn write_soak_captures() {
+    let _serial = render_serial();
+    render_soak_edition(&SoakEdition {
+        activate: true,
+        rss_leak_bytes_per_hour: 0.0,
+        wav_start: "soak_start.wav",
+        wav_end: "soak_end.wav",
+        telemetry: "soak_telemetry.jsonl",
+        report: "soak_report.json",
+    });
+}
+
+/// Silence half of the §6.1 pairing: stems loaded but never activated — the
+/// transport runs and F advances over a silent mix. The soak analysis must
+/// FAIL this (RMS floor + onset counts), while its frames-advance gate
+/// passes — proving the audio gates, not the telemetry, catch silence.
+#[test]
+fn write_soak_silent_captures() {
+    let _serial = render_serial();
+    render_soak_edition(&SoakEdition {
+        activate: false,
+        rss_leak_bytes_per_hour: 0.0,
+        wav_start: "soak_silent_start.wav",
+        wav_end: "soak_silent_end.wav",
+        telemetry: "soak_silent_telemetry.jsonl",
+        report: "soak_silent_report.json",
+    });
+}
+
+/// Leak edition: clean audio with a synthetic +30 MiB/h RSS ramp — the
+/// rss-slope gate must FAIL it (the analyzer-math control; RSS itself is a
+/// device quantity, proven on hardware by the C5 run).
+#[test]
+fn write_soak_leaky_captures() {
+    let _serial = render_serial();
+    render_soak_edition(&SoakEdition {
+        activate: true,
+        rss_leak_bytes_per_hour: 30.0 * 1024.0 * 1024.0,
+        wav_start: "soak_leaky_start.wav",
+        wav_end: "soak_leaky_end.wav",
+        telemetry: "soak_leaky_telemetry.jsonl",
+        report: "soak_leaky_report.json",
+    });
+}
+
+/// Sabotage half of the §6.1 pairing: stretch_disabled plays the cross
+/// stems at the wrong rate — onset counts fail in BOTH windows at any soak
+/// duration (the same C0 control, applied to the soak instruments).
+#[cfg(feature = "drift-injection")]
+#[test]
+fn write_soak_stretch_disabled_captures() {
+    let _serial = render_serial();
+    maestro_core::sabotage::set_mode(maestro_core::sabotage::Sabotage::StretchDisabled);
+    render_soak_edition(&SoakEdition {
+        activate: true,
+        rss_leak_bytes_per_hour: 0.0,
+        wav_start: "soak_stretch_disabled_start.wav",
+        wav_end: "soak_stretch_disabled_end.wav",
+        telemetry: "soak_stretch_disabled_telemetry.jsonl",
+        report: "soak_stretch_disabled_report.json",
+    });
+    maestro_core::sabotage::set_mode(maestro_core::sabotage::Sabotage::None);
+}

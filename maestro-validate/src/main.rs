@@ -129,6 +129,49 @@ mod thresholds {
     /// stem over the whole capture (measured 0.12 on device; an order of
     /// magnitude of margin).
     pub const STEM_PRESENT_RMS_FLOOR: f64 = 0.01;
+    /// VALIDATION-THRESHOLD (C5, ADR-096): cross-stem drift over the soak —
+    /// |median cross-stem offset in the END capture − median in the START
+    /// capture|, expected 0. Cross-stem medians are alignment-free (a
+    /// common-mode output-path shift — the ADR-091 +5695 anomaly class —
+    /// cancels in L−R, so a 4-hour gap between the windows cannot
+    /// false-fail this), and device evidence shows them stable to tens of
+    /// samples across independent captures (control: 43 = 43 across a
+    /// pause; 51 → 51 at C2). Same 96-sample class separation as every
+    /// boundary gate: the historic drift class (spec A.1, ~2.4 samples/min)
+    /// measures ~576 samples over 4 h; a healthy engine measures ~0.
+    pub const SOAK_DRIFT_STEP_MAX: i64 = 96;
+    /// VALIDATION-THRESHOLD (C5, ADR-096): "no memory growth (RSS slope
+    /// ≈ 0)" — LS fit of phys_footprint over the soak from 25% elapsed
+    /// onward (the load/cache warmup excluded), in bytes/hour, plus a net
+    /// first→last bound over the same region. A-priori calibration
+    /// (recalibrated on first device evidence with an ADR — the
+    /// GAP_RMS_FLOOR precedent): the smallest plausible leak classes
+    /// measure ≥ 20 MiB/h (16 B per render block = 86 MiB over 4 h; one
+    /// leaked ~2 KB snapshot string per poll = 100+ MiB), while iOS
+    /// phys_footprint noise for a steady foreground audio app is
+    /// single-digit MiB.
+    pub const SOAK_RSS_SLOPE_MAX_BYTES_PER_HOUR: f64 = 4.0 * 1024.0 * 1024.0;
+    pub const SOAK_RSS_NET_MAX_BYTES: f64 = 12.0 * 1024.0 * 1024.0;
+    /// VALIDATION-THRESHOLD (C5, ADR-096): render-budget headroom unchanged
+    /// hour 1 vs hour 4 (spec §5 M5). Thermal varies over 4 h, so the gate
+    /// compares WINDOWS: the over-half-period fraction is computed per
+    /// window from the telemetry counters' deltas, first window vs last
+    /// window must agree within this delta, and the last window must also
+    /// hold the absolute §3.3 gate (≤ 1%). 0.5% is half the absolute gate —
+    /// a thermal-degradation class that doubles the burst rate is caught
+    /// while sub-0.1% measurement scatter (C0–C4 measured 0.000–0.77%)
+    /// passes.
+    pub const SOAK_BUDGET_WINDOW_DELTA_MAX: f64 = 0.005;
+    /// VALIDATION-THRESHOLD (C5, ADR-096): anti-stub — engineFrame must
+    /// advance at the engine rate (48 kHz) across the telemetry span within
+    /// 1%. A paused, stalled, or wall-clock-paced engine fails here before
+    /// any audio gate could pass vacuously (the §6.1 rule applied to the
+    /// telemetry lane).
+    pub const SOAK_FRAME_ADVANCE_TOL: f64 = 0.01;
+    /// VALIDATION-THRESHOLD (C5, ADR-096): minimum telemetry samples for the
+    /// soak fits to be meaningful (5 s cadence ⇒ 24 = two minutes; a real
+    /// soak carries thousands).
+    pub const SOAK_MIN_TELEMETRY_SAMPLES: usize = 24;
 }
 
 #[derive(Serialize)]
@@ -154,8 +197,25 @@ struct Report {
     total_drift_samples: f64,
     /// C1 timing scenario: per-window medians (samples, grid-relative).
     timing: Option<TimingNumbers>,
+    /// C5 soak scenario: start/end window numbers + telemetry fits.
+    soak: Option<SoakNumbers>,
     gates: Vec<GateResult>,
     passed: bool,
+}
+
+#[derive(Serialize)]
+struct SoakNumbers {
+    start_median: i64,
+    end_median: i64,
+    drift_step: i64,
+    telemetry_samples: usize,
+    elapsed_seconds: f64,
+    frame_advance_ratio: f64,
+    rss_slope_bytes_per_hour: f64,
+    rss_net_bytes: f64,
+    budget_window_seconds: f64,
+    budget_frac_first_window: f64,
+    budget_frac_last_window: f64,
 }
 
 #[derive(Serialize)]
@@ -436,8 +496,10 @@ fn zero_accumulation(w: &Window) -> (bool, String) {
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
-    let usage = "usage: maestro-validate --capture <wav> --scenario <unity|cross|timing|budget> \
-                 --tempo-mbpm <120000> [--harness-report <json>] [--report <out.json>] [--expect-fail]";
+    let usage = "usage: maestro-validate --capture <wav> \
+                 --scenario <unity|cross|timing|budget|control|interruption|memory|soak> \
+                 --tempo-mbpm <120000> [--harness-report <json>] [--report <out.json>] \
+                 [--capture-end <wav> --telemetry <jsonl>] [--expect-fail]";
 
     let Some(capture_path) = arg(&args, "--capture") else {
         eprintln!("{usage}");
@@ -542,6 +604,32 @@ fn main() -> ExitCode {
         "memory" => {
             let hr = harness_json.as_ref().expect("--harness-report is required for memory");
             analyze_memory(&wav, hr, tempo_mbpm, &mut gate, &mut report);
+        }
+        "soak" => {
+            // C5 (spec §5 M5, ADR-096): bounded captures at start and end of
+            // the soak + counter telemetry logged throughout. A 4-hour WAV
+            // would be ~5.8 GB; the drift gate needs onsets, not hours of
+            // waveform — the telemetry lane carries everything between the
+            // windows.
+            let end_path =
+                arg(&args, "--capture-end").expect("--capture-end is required for soak");
+            let telemetry_path =
+                arg(&args, "--telemetry").expect("--telemetry is required for soak");
+            let end_wav = match load_float_wav(Path::new(&end_path)) {
+                Ok(w) => w,
+                Err(e) => {
+                    eprintln!("cannot read end capture: {e}");
+                    return ExitCode::from(2);
+                }
+            };
+            let telemetry = match parse_telemetry(Path::new(&telemetry_path)) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("cannot read telemetry: {e}");
+                    return ExitCode::from(2);
+                }
+            };
+            analyze_soak(&wav, &end_wav, &telemetry, tempo_mbpm, &mut gate, &mut report);
         }
         _ => {
             analyze_offset_pairs(&wav, &scenario, tempo_mbpm, harness_json.as_ref(), &mut gate, &mut report);
@@ -1536,4 +1624,307 @@ fn analyze_memory(
         format!("stem R overall RMS {r_rms:.5} (floor {})", thresholds::STEM_PRESENT_RMS_FLOOR),
     );
     report.analyzed_pairs = 0;
+}
+
+// ---------------------------------------------------------------------------
+// C5 soak analysis (spec §5 M5, ADR-096): start/end capture windows + the
+// counter telemetry logged throughout the soak
+// ---------------------------------------------------------------------------
+
+/// One soak telemetry line (`soak_telemetry.jsonl`): a snapshot poll's
+/// counters plus the process RSS, stamped with wall time. Written by the
+/// device harness every 5 s; synthesized by the offline smoke edition.
+struct TelemetrySample {
+    t_ms: f64,
+    engine_frame: u64,
+    underruns: u64,
+    blocks_total: u64,
+    blocks_over_half_period: u64,
+    events_dropped: u64,
+    rss_bytes: f64,
+}
+
+fn parse_telemetry(path: &Path) -> Result<Vec<TelemetrySample>, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut samples = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        // Tolerate one torn trailing line (the soak may end mid-write).
+        let v: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(e) if i + 1 == text.lines().count() => {
+                eprintln!("telemetry: ignoring torn final line ({e})");
+                continue;
+            }
+            Err(e) => return Err(format!("telemetry line {}: {e}", i + 1)),
+        };
+        let f = |k: &str| v.get(k).and_then(|x| x.as_f64());
+        let u = |k: &str| v.get(k).and_then(|x| x.as_u64());
+        samples.push(TelemetrySample {
+            t_ms: f("tMs").ok_or_else(|| format!("telemetry line {}: tMs", i + 1))?,
+            engine_frame: u("engineFrame").ok_or_else(|| format!("line {}: engineFrame", i + 1))?,
+            underruns: u("underruns").unwrap_or(u64::MAX),
+            blocks_total: u("blocksTotal").unwrap_or(0),
+            blocks_over_half_period: u("blocksOverHalfPeriod").unwrap_or(u64::MAX),
+            events_dropped: u("eventsDropped").unwrap_or(u64::MAX),
+            rss_bytes: f("rssBytes").unwrap_or(0.0),
+        });
+    }
+    Ok(samples)
+}
+
+/// Least squares over (x, y) pairs → slope (y units per x unit).
+fn ls_slope_xy(points: &[(f64, f64)]) -> f64 {
+    let n = points.len() as f64;
+    if points.len() < 2 {
+        return 0.0;
+    }
+    let mx = points.iter().map(|p| p.0).sum::<f64>() / n;
+    let my = points.iter().map(|p| p.1).sum::<f64>() / n;
+    let num: f64 = points.iter().map(|p| (p.0 - mx) * (p.1 - my)).sum();
+    let den: f64 = points.iter().map(|p| (p.0 - mx) * (p.0 - mx)).sum();
+    if den == 0.0 {
+        0.0
+    } else {
+        num / den
+    }
+}
+
+fn channel_rms(samples: &[f32]) -> f64 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    (samples.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>() / samples.len() as f64).sqrt()
+}
+
+/// One capture window of the soak, analyzed with the same instruments as the
+/// `cross` scenario (counts exact, RMS anti-stub, cross-stem pairing,
+/// zero-accumulation by periodicity/spread): returns the window's cross-stem
+/// median offset. Cross-stem offsets are alignment-free, so the start↔end
+/// comparison cannot be false-failed by a common-mode output-path shift
+/// between the windows (the ADR-091 anomaly class).
+fn analyze_soak_window(
+    wav: &maestro_core::validation::LoadedWav,
+    label: &str,
+    tempo_mbpm: u64,
+    gate: &mut impl FnMut(&str, bool, String),
+) -> Option<i64> {
+    let beat_frames = (60_000.0 / tempo_mbpm as f64) * wav.sample_rate as f64;
+    let min_gap = (beat_frames / 2.0) as usize;
+
+    let onsets_l = detect_click_onsets(&wav.channels[0], thresholds::ONSET_THRESHOLD, min_gap);
+    let onsets_r = detect_click_onsets(&wav.channels[1], thresholds::ONSET_THRESHOLD, min_gap);
+
+    // Anti-stub first (§6.1): silence or a dead stem fails before any sync
+    // gate could pass vacuously.
+    let l_rms = channel_rms(&wav.channels[0]);
+    let r_rms = channel_rms(&wav.channels[1]);
+    gate(
+        &format!("{label}-stems-present"),
+        l_rms > thresholds::STEM_PRESENT_RMS_FLOOR && r_rms > thresholds::STEM_PRESENT_RMS_FLOOR,
+        format!("RMS L {l_rms:.5} R {r_rms:.5} (floor {})", thresholds::STEM_PRESENT_RMS_FLOOR),
+    );
+
+    let expected = (wav.frames as f64 / beat_frames).floor() as i64;
+    let count_ok = |n: usize| (n as i64 - expected).abs() <= 2;
+    gate(
+        &format!("{label}-onset-count"),
+        count_ok(onsets_l.len()) && count_ok(onsets_r.len()),
+        format!("expected ≈{expected} clicks/stem, got L={} R={}", onsets_l.len(), onsets_r.len()),
+    );
+
+    // Cross-stem pairing (the analyze_offset_pairs design).
+    let half_beat = (beat_frames / 2.0) as i64;
+    let mut offsets: Vec<i64> = Vec::new();
+    let mut ri = 0usize;
+    for &l in onsets_l.iter().skip(thresholds::SKIP_LEADING_ONSETS) {
+        while ri + 1 < onsets_r.len()
+            && (onsets_r[ri + 1] as i64 - l as i64).abs() < (onsets_r[ri] as i64 - l as i64).abs()
+        {
+            ri += 1;
+        }
+        if ri < onsets_r.len() {
+            let d = l as i64 - onsets_r[ri] as i64;
+            if d.abs() < half_beat {
+                offsets.push(d);
+            }
+        }
+    }
+    gate(
+        &format!("{label}-analyzed-pairs"),
+        offsets.len() >= thresholds::MIN_ANALYZED_ONSETS,
+        format!("{} cross-stem onset pairs (min {})", offsets.len(), thresholds::MIN_ANALYZED_ONSETS),
+    );
+    if offsets.len() < 2 {
+        return None;
+    }
+
+    let med = median(&offsets);
+    let slope = linear_slope(&offsets);
+    let spread = offsets.iter().max().unwrap() - offsets.iter().min().unwrap();
+    let window = Window { offsets, median: med, slope, spread };
+    let (ok, detail) = zero_accumulation(&window);
+    gate(&format!("{label}-zero-drift"), ok, detail);
+    gate(
+        &format!("{label}-offset-bounded"),
+        spread <= thresholds::STRETCH_OFFSET_SPREAD_MAX,
+        format!("spread {spread} (limit {})", thresholds::STRETCH_OFFSET_SPREAD_MAX),
+    );
+    Some(med)
+}
+
+fn analyze_soak(
+    start_wav: &maestro_core::validation::LoadedWav,
+    end_wav: &maestro_core::validation::LoadedWav,
+    telemetry: &[TelemetrySample],
+    tempo_mbpm: u64,
+    gate: &mut impl FnMut(&str, bool, String),
+    report: &mut Report,
+) {
+    // ------------------------------------------------- capture-window gates
+    let start_median = analyze_soak_window(start_wav, "start", tempo_mbpm, gate);
+    let end_median = analyze_soak_window(end_wav, "end", tempo_mbpm, gate);
+
+    // The C5 drift gate: cross-stem median equal start → end (expected 0).
+    let drift_step = match (start_median, end_median) {
+        (Some(s), Some(e)) => {
+            let step = e - s;
+            gate(
+                "soak-drift-start-end",
+                step.abs() <= thresholds::SOAK_DRIFT_STEP_MAX,
+                format!(
+                    "cross-stem median offset: start {s} vs end {e} (step {step}, expected 0 ± {}; \
+                     the A.1 drift class measures ~576 over 4 h)",
+                    thresholds::SOAK_DRIFT_STEP_MAX
+                ),
+            );
+            step
+        }
+        _ => {
+            gate("soak-drift-start-end", false, "a capture window was unanalyzable".into());
+            0
+        }
+    };
+
+    // ---------------------------------------------------- telemetry gates
+    gate(
+        "soak-telemetry-samples",
+        telemetry.len() >= thresholds::SOAK_MIN_TELEMETRY_SAMPLES,
+        format!("{} telemetry samples (min {})", telemetry.len(), thresholds::SOAK_MIN_TELEMETRY_SAMPLES),
+    );
+    let (Some(first), Some(last)) = (telemetry.first(), telemetry.last()) else {
+        return;
+    };
+    let elapsed_ms = last.t_ms - first.t_ms;
+    let elapsed_s = elapsed_ms / 1000.0;
+
+    // Anti-stub (§6.1, telemetry lane): F must advance at the engine rate.
+    let frames = (last.engine_frame - first.engine_frame.min(last.engine_frame)) as f64;
+    let expected_frames = 48_000.0 * elapsed_s;
+    let ratio = if expected_frames > 0.0 { frames / expected_frames } else { 0.0 };
+    gate(
+        "soak-frames-advance",
+        (ratio - 1.0).abs() <= thresholds::SOAK_FRAME_ADVANCE_TOL,
+        format!(
+            "engineFrame advanced {frames:.0} over {elapsed_s:.0} s — {ratio:.4}× the engine rate \
+             (gate 1 ± {})",
+            thresholds::SOAK_FRAME_ADVANCE_TOL
+        ),
+    );
+
+    // Underruns and RT event drops over the WHOLE soak (monotonic counters).
+    gate(
+        "soak-underruns",
+        last.underruns == 0,
+        format!("{} underruns over the soak (gate: 0)", last.underruns),
+    );
+    gate(
+        "soak-events-dropped",
+        last.events_dropped == 0,
+        format!("{} RT events dropped over the soak (gate: 0)", last.events_dropped),
+    );
+
+    // RSS slope ≈ 0 (spec §5 M5): LS fit from 25% elapsed onward — the
+    // load/decode warmup excluded — in bytes/hour, plus the net growth over
+    // the same region.
+    let fit_start = first.t_ms + elapsed_ms * 0.25;
+    let rss_points: Vec<(f64, f64)> = telemetry
+        .iter()
+        .filter(|s| s.t_ms >= fit_start && s.rss_bytes > 0.0)
+        .map(|s| (s.t_ms, s.rss_bytes))
+        .collect();
+    let rss_slope_per_hour = ls_slope_xy(&rss_points) * 3_600_000.0;
+    let rss_net = match (rss_points.first(), rss_points.last()) {
+        (Some(a), Some(b)) => b.1 - a.1,
+        _ => f64::INFINITY,
+    };
+    gate(
+        "soak-rss-slope",
+        !rss_points.is_empty()
+            && rss_slope_per_hour.abs() <= thresholds::SOAK_RSS_SLOPE_MAX_BYTES_PER_HOUR
+            && rss_net.abs() <= thresholds::SOAK_RSS_NET_MAX_BYTES,
+        format!(
+            "RSS slope {:.2} MiB/h, net {:+.2} MiB over the fit region ({} samples from 25% \
+             elapsed; gates ≤ {:.0} MiB/h and ≤ {:.0} MiB net)",
+            rss_slope_per_hour / (1024.0 * 1024.0),
+            rss_net / (1024.0 * 1024.0),
+            rss_points.len(),
+            thresholds::SOAK_RSS_SLOPE_MAX_BYTES_PER_HOUR / (1024.0 * 1024.0),
+            thresholds::SOAK_RSS_NET_MAX_BYTES / (1024.0 * 1024.0)
+        ),
+    );
+
+    // Render-budget headroom hour 1 vs hour 4 (window-vs-window — thermal
+    // varies over 4 h, spec §5 M5): over-half-period fraction per window
+    // from the cumulative counters' deltas.
+    let window_ms = (3_600_000.0f64).min(elapsed_ms / 4.0).max(1.0);
+    let sample_at = |t: f64| -> &TelemetrySample {
+        telemetry
+            .iter()
+            .min_by(|a, b| {
+                (a.t_ms - t).abs().partial_cmp(&(b.t_ms - t).abs()).unwrap()
+            })
+            .unwrap()
+    };
+    let frac_between = |a: &TelemetrySample, b: &TelemetrySample| -> f64 {
+        let blocks = b.blocks_total.saturating_sub(a.blocks_total);
+        let over = b.blocks_over_half_period.saturating_sub(a.blocks_over_half_period);
+        if blocks == 0 {
+            f64::INFINITY
+        } else {
+            over as f64 / blocks as f64
+        }
+    };
+    let frac_first = frac_between(first, sample_at(first.t_ms + window_ms));
+    let frac_last = frac_between(sample_at(last.t_ms - window_ms), last);
+    gate(
+        "soak-budget-window-equal",
+        (frac_last - frac_first).abs() <= thresholds::SOAK_BUDGET_WINDOW_DELTA_MAX
+            && frac_last <= thresholds::MAX_OVER_HALF_PERIOD_FRACTION,
+        format!(
+            "blocks over half period: first window {:.4}% vs last window {:.4}% \
+             ({:.0} s windows; gates |Δ| ≤ {:.2}% and last ≤ 1%)",
+            frac_first * 100.0,
+            frac_last * 100.0,
+            window_ms / 1000.0,
+            thresholds::SOAK_BUDGET_WINDOW_DELTA_MAX * 100.0
+        ),
+    );
+
+    report.soak = Some(SoakNumbers {
+        start_median: start_median.unwrap_or(0),
+        end_median: end_median.unwrap_or(0),
+        drift_step,
+        telemetry_samples: telemetry.len(),
+        elapsed_seconds: elapsed_s,
+        frame_advance_ratio: ratio,
+        rss_slope_bytes_per_hour: rss_slope_per_hour,
+        rss_net_bytes: rss_net,
+        budget_window_seconds: window_ms / 1000.0,
+        budget_frac_first_window: frac_first,
+        budget_frac_last_window: frac_last,
+    });
 }

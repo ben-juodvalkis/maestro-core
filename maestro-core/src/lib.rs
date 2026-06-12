@@ -62,3 +62,25 @@ pub mod ffi;
 // UniFFI scaffolding must be defined at the crate root.
 #[cfg(feature = "uniffi-bindings")]
 uniffi::setup_scaffolding!();
+
+// ---------------------------------------------------------------------------
+// D8 build-slice canaries (spec §5 M5, ADR-096). The abandoned branch
+// shipped a debug-only xcframework for months because nothing STRUCTURAL
+// prevented it. These symbols exist only in the slices that must never
+// ship: the packaging script (`maestro-core/scripts/build-ios.sh`), the
+// plugin pod's release-guard script phase, and the CI release pipeline all
+// `nm`-grep for them — a debug slice cannot be packaged or linked into a
+// Release app build, and the published artifact can carry neither debug
+// asserts nor the sabotage surface.
+// ---------------------------------------------------------------------------
+
+/// Present only when compiled with debug assertions (a debug/dev profile).
+#[cfg(debug_assertions)]
+#[no_mangle]
+pub static MAESTRO_DEBUG_BUILD_CANARY: u8 = 1;
+
+/// Present only in drift-injection (sabotage) builds — valid for local
+/// negative-control device runs (spec §6.4), never for a published artifact.
+#[cfg(feature = "drift-injection")]
+#[no_mangle]
+pub static MAESTRO_DRIFT_INJECTION_CANARY: u8 = 1;
