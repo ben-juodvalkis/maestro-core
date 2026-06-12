@@ -253,9 +253,15 @@ for each active track i:
     if O_i == E (unity):                     // bypass: span == B exactly
         read B source samples via pcm_i(·) (circular, Bresenham wrap) → track buffer
     else:                                    // stretch path
-        feed exactly `span` source samples (read via pcm_i(·)) into the track's
-        Signalsmith stretcher (streaming process(input[span], output[B]))
-        → track buffer
+        span_L = u_i(bu(F+B) + E·L_out) − u_i(bu(F) + E·L_out)   // L_out = stretcher output latency
+        feed exactly `span_L` source samples (read via pcm_i(·) at the lead
+        positions) into the track's Signalsmith stretcher
+        (streaming process(input[span_L], output[B])) → track buffer
+        // The feed leads the playhead by exactly L_out OUTPUT frames of
+        // musical time (E·L_out beat-units), cancelling the vocoder's
+        // constant output latency: stretched output lands ON the derived
+        // grid, not 60 ms behind it (ADR-094). Rate-independent; spans
+        // telescope within a tempo segment exactly as before.
     apply gain/pan (+ activation ramp if just armed) and mix into the output
 F += B
 write snapshot (seqlock); drain RT commands at block boundary
@@ -263,11 +269,15 @@ write snapshot (seqlock); drain RT commands at block boundary
 
 Design decisions, each closing a §2 defect:
 
-- **Streaming, not re-seek (closes D3's engine half).** During continuous playback the
+- **Streaming, not re-seek (closes D3's engine half).** Within a tempo segment the
   stretcher is **never seeked**; it consumes the circular source stream. Loop seams are
-  ordinary audio (assets are validated seamless, §3.4). Tempo changes only change `span` —
-  Signalsmith accepts arbitrary in/out counts per call (`process(input, output)`, ratio
-  implied per call); no re-anchor, no phase reset, no transient.
+  ordinary audio (assets are validated seamless, §3.4) — Signalsmith accepts arbitrary
+  in/out counts per call (`process(input, output)`, ratio implied per call). A tempo
+  change is a feed-schedule boundary (the compensated lead is a function of E, ADR-094):
+  stretch-path tracks re-anchor at the change block, fading out one final block of the
+  OLD schedule from the still-warm stretcher (waveform-continuous) under the one-block
+  equal-power crossfade — no transient (T-SEAM-gated across the change), positions
+  untouched.
 - **The stretcher is a slave, never an authority.** Cumulative input fed after any number of
   blocks is exactly `u_i(F) − u_i(F_anchor)` (telescoping). The stretcher cannot reposition
   a track; the worst it can do is smear inside its constant ~120 ms window — bounded,
@@ -276,9 +286,11 @@ Design decisions, each closing a §2 defect:
   tempo moves off unity, the track anchors a stretcher (below) and crossfades bypass→stretch
   over one block (equal-power, ≤ 10 ms); positions are unaffected (they are derived).
   Hysteresis: unity means `O_i == E` exactly (integer compare).
-- **Anchoring (start, variation switch, unity transition, post-`ResetTimeline`).** One-time
-  procedure: `reset()`; build a seek window of `input_latency + output_latency` source
-  frames ending at `pcm_i(u_i(F₀) + input_latency)`; `seek(window, rate)`; then stream.
+- **Anchoring (start, variation switch, unity transition, stretch-path tempo change,
+  post-`ResetTimeline`).** One-time procedure: `reset()`; build a seek window of
+  `input_latency + output_latency` source frames ending at the compensated feed origin
+  `pcm_i(u_i(bu(F₀) + E·output_latency) + input_latency)` (ADR-094); `seek(window, rate)`;
+  then stream.
   The known one-block smear of `seek()` (ADR-089's empirical finding) is masked by the
   ≤ 10 ms activation gain ramp and occurs only at musically chosen entries — never at loop
   seams. Latency values are read from the instance (deterministic per §2.3#4; correctness
@@ -643,8 +655,10 @@ Seamless tonal fixture (integer-cycle sine) + metronome fixtures, rates {1.0, 0.
 every wrap window (the branch engine fails this only when content is discontinuous — our
 loader guarantees it isn't; the engine must keep it true through streaming feed); (b) click
 onsets land on the exact derived grid (onset frame == predicted frame from `u(F)` inversion,
-± 0 for bypass; for the stretch path, a **constant** measured offset with zero per-wrap
-variance). **Negative control:** the double-trim sabotage fixture (2112 samples chopped)
+± 0 for bypass; for the stretch path, ON the same grid — absolute median within the 2 ms
+class bound, ADR-094 — with zero per-wrap variance; the uncompensated output latency, a
+constant 2880, is a gated regression). **Negative control:** the double-trim sabotage
+fixture (2112 samples chopped)
 must produce a detected seam transient — proving the detector sees real seam clicks
 (reproduced at 0.35 vs 0.0115 baseline, Appendix A.2).
 

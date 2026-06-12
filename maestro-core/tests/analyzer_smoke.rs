@@ -8,6 +8,8 @@
 //! - `cross.wav` — metronome_60 (L) + metronome_90 (R) at tempo 120 (stretch)
 //! - `cross_stretch_disabled.wav` — same, with the StretchDisabled sabotage
 //!   (only when built with `--features drift-injection`)
+//! - `unitycross.wav` — metronome_120 stems through the §6.4 timing script
+//!   with a 120→117 change (unity-crossing — the ADR-094 pin; see below)
 //!
 //! CI / device-validation.sh then runs `maestro-validate` against these:
 //! the first two must PASS, the sabotaged one must FAIL (`--expect-fail`).
@@ -94,8 +96,12 @@ fn render_scenario(stems: &[Stem], out_name: &str) {
 /// (observed as an order-dependent flake at M3). Every test in this file
 /// takes this lock first; a poisoned lock is fine (the panicking test
 /// already failed the suite).
+/// Test-orchestration lock, never engine code — the §3.3 no-locks rule (and
+/// the clippy disallowed-types gate enforcing it) protects the render path.
+#[allow(clippy::disallowed_types)]
 static RENDER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+#[allow(clippy::disallowed_types)]
 fn render_serial() -> std::sync::MutexGuard<'static, ()> {
     RENDER_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -156,7 +162,37 @@ const T_B_RESTART: u64 = 35 * SAMPLE_RATE as u64;
 const T_VARIATION: u64 = 40 * SAMPLE_RATE as u64;
 const TIMING_TEMPO_AFTER: u32 = 100_000;
 
+/// One §6.4 timing-script parameterization (the same command schedule, two
+/// stem/tempo geometries): the C1 `timing` scenario (60/90-BPM stems, change
+/// 120→100 — both sides stretch) and the ADR-094 `unitycross` scenario
+/// (metronome_120 stems, change 120→117 — the change crosses the unity
+/// boundary, the C3 finding's geometry).
+struct TimingScript {
+    stems: [Stem; 2],
+    tempo_after: u32,
+    var_fixture: &'static str,
+    var_o_mbpm: u32,
+    scenario_label: &'static str,
+}
+
+fn c1_timing_script() -> TimingScript {
+    TimingScript {
+        stems: [
+            Stem { fixture: "metronome_60.wav", o_mbpm: 60_000, pan: -1.0 },
+            Stem { fixture: "metronome_90.wav", o_mbpm: 90_000, pan: 1.0 },
+        ],
+        tempo_after: TIMING_TEMPO_AFTER,
+        var_fixture: "metronome_60_var.wav",
+        var_o_mbpm: 60_000,
+        scenario_label: "timing",
+    }
+}
+
 fn render_timing_scenario(out_name: &str, report_name: &str) {
+    render_timing_script(&c1_timing_script(), out_name, report_name);
+}
+
+fn render_timing_script(script: &TimingScript, out_name: &str, report_name: &str) {
     let (mut plane, mut core) = create_engine(EngineConfig {
         sample_rate: SAMPLE_RATE,
         initial_tempo_mbpm: TEMPO,
@@ -164,10 +200,7 @@ fn render_timing_scenario(out_name: &str, report_name: &str) {
     })
     .unwrap();
 
-    let stems = [
-        Stem { fixture: "metronome_60.wav", o_mbpm: 60_000, pan: -1.0 },
-        Stem { fixture: "metronome_90.wav", o_mbpm: 90_000, pan: 1.0 },
-    ];
+    let stems = &script.stems;
     for (slot, stem) in stems.iter().enumerate() {
         let wav = load_float_wav(&fixture_path(stem.fixture)).unwrap();
         plane
@@ -198,7 +231,7 @@ fn render_timing_scenario(out_name: &str, report_name: &str) {
     }
     assert!(matches!(plane.dispatch(Command::Play), CommandResult::Ok));
 
-    let var_wav = load_float_wav(&fixture_path("metronome_60_var.wav")).unwrap();
+    let var_wav = load_float_wav(&fixture_path(script.var_fixture)).unwrap();
 
     let total = CAPTURE_SECONDS * SAMPLE_RATE as u64;
     let mut cap_l = Vec::with_capacity(total as usize);
@@ -217,7 +250,7 @@ fn render_timing_scenario(out_name: &str, report_name: &str) {
             }
             T_TEMPO => {
                 assert!(matches!(
-                    plane.dispatch(Command::SetTempo { mbpm: TIMING_TEMPO_AFTER }),
+                    plane.dispatch(Command::SetTempo { mbpm: script.tempo_after }),
                     CommandResult::Ok
                 ));
             }
@@ -236,7 +269,7 @@ fn render_timing_scenario(out_name: &str, report_name: &str) {
                         &LoadMeta {
                             sample_rate: 48_000,
                             slot: 0,
-                            original_tempo_mbpm: 60_000,
+                            original_tempo_mbpm: script.var_o_mbpm,
                             loop_beats: 16,
                             encoder_delay: 0,
                             end_padding: 0,
@@ -266,7 +299,7 @@ fn render_timing_scenario(out_name: &str, report_name: &str) {
     write_float_wav_stereo(&dir.join(out_name), &cap_l, &cap_r, SAMPLE_RATE).unwrap();
     // Harness-shaped report: the same fields the device writes (spec §6.4).
     let report = serde_json::json!({
-        "scenario": "timing",
+        "scenario": script.scenario_label,
         "scenarioSeconds": CAPTURE_SECONDS,
         "finalSnapshot": snapshot,
         "events": events,
@@ -281,6 +314,32 @@ fn render_timing_scenario(out_name: &str, report_name: &str) {
 fn write_timing_capture() {
     let _serial = render_serial();
     render_timing_scenario("timing.wav", "timing_report.json");
+}
+
+/// ADR-094 device-loop smoke: the same §6.4 script with the tempo change
+/// crossing the UNITY boundary — metronome_120 stems (O = engine tempo) and
+/// 120→117, the UI tempo button's single step (ratio 40/39: the offset
+/// pattern is aperiodic; the analyzer's window-spread fallback covers it,
+/// ADR-093). Analyzed with `--stem-tempo-mbpm 120000`: the expected step
+/// across the change is STRETCH_PATH_PREROLL = 0 — the compensated engine
+/// passes, an uncompensated one measures 2880 and fails.
+#[test]
+fn write_unitycross_capture() {
+    let _serial = render_serial();
+    render_timing_script(
+        &TimingScript {
+            stems: [
+                Stem { fixture: "metronome_120.wav", o_mbpm: 120_000, pan: -1.0 },
+                Stem { fixture: "metronome_120.wav", o_mbpm: 120_000, pan: 1.0 },
+            ],
+            tempo_after: 117_000,
+            var_fixture: "metronome_120_var.wav",
+            var_o_mbpm: 120_000,
+            scenario_label: "unitycross",
+        },
+        "unitycross.wav",
+        "unitycross_report.json",
+    );
 }
 
 /// The C1 stale-reanchor negative control, offline edition (defect D7: the

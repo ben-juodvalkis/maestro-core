@@ -35,6 +35,18 @@ pub const BYPASS_GRID_TOLERANCE: i64 = 20;
 /// and non-accumulating; repositioning is impossible).
 pub const STRETCH_ONSET_JITTER_MAX: i64 = 480;
 
+/// VALIDATION-THRESHOLD (ADR-094): absolute onset-grid median bound for the
+/// stretch path — the median offset of detected onsets against the derived
+/// grid, after the engine's output-latency compensation. The C3 finding
+/// (ADR-093) measured the UNcompensated stretch path a constant 2880 samples
+/// (Signalsmith preset_default output latency, spec §2.3#4) late; with the
+/// §3.2 feed-lead compensation the constant must be ~0. 96 (2 ms) is the same
+/// class-separation bound as the device analyzer's TEMPO_CHANGE_STEP_MAX:
+/// the vocoder's attack-smear bias stays within tens of samples, while every
+/// defect class (uncompensated pre-roll 2880, stale re-anchor ≥ 1000, lost
+/// render chunk ≥ 512) sits far outside it.
+pub const STRETCH_GRID_MEDIAN_MAX: i64 = 96;
+
 /// VALIDATION-THRESHOLD: longest admissible period (in beats) of the
 /// stretch-path onset-offset pattern (= lcm(beat grid, vocoder hop grid) /
 /// beat). Aperiodicity within this horizon means accumulation — drift.

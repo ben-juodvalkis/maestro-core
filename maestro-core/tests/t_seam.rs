@@ -24,7 +24,7 @@ mod common;
 
 use common::validation_thresholds::{
     BYPASS_GRID_TOLERANCE, MAX_ONSET_PATTERN_PERIOD_BEATS, MIN_ANALYZED_WRAPS, MIN_MIX_RMS,
-    ONSET_THRESHOLD, SEAM_STEP_FACTOR, STRETCH_ONSET_JITTER_MAX,
+    ONSET_THRESHOLD, SEAM_STEP_FACTOR, STRETCH_GRID_MEDIAN_MAX, STRETCH_ONSET_JITTER_MAX,
 };
 use common::{detect_click_onsets, fixture_path, load_float_wav, make_sine_pcm, SAMPLE_RATE};
 use maestro_api::{Command, CommandResult, EngineConfig, LoadMeta};
@@ -134,6 +134,15 @@ fn natural_max_step(pcm: &[f32]) -> f32 {
     max
 }
 
+/// Median of an offset sequence (the absolute-grid constant of a window —
+/// robust against the periodic vocoder smear, which the spread gate bounds).
+fn median_offset(offsets: &[i64]) -> i64 {
+    assert!(!offsets.is_empty());
+    let mut sorted = offsets.to_vec();
+    sorted.sort_unstable();
+    sorted[sorted.len() / 2]
+}
+
 /// Max inter-sample step in `signal[from..]`, with the frame where it occurs.
 fn max_step_from(signal: &[f32], from: usize) -> (f32, usize) {
     let mut max = 0.0f32;
@@ -200,8 +209,16 @@ fn t_seam_metronome_onset_grid_all_rates() {
             render_capture(tempo, wav.channels[0].clone(), wav.channels[1].clone(), total);
 
         let onsets = detect_click_onsets(&capture, ONSET_THRESHOLD, bf as usize / 2);
-        let analyzed: Vec<u64> =
-            onsets.iter().map(|&o| o as u64).filter(|&o| o >= wf).collect();
+        // Onset → grid-slot assignment with a half-beat guard at both window
+        // edges (ADR-094): the compensated stretch path lands onsets ON the
+        // grid, so a beat's detection can sit a few samples EARLY of an exact
+        // wrap boundary (measured −21 at rate 0.75). A raw `o >= wf` filter
+        // would chop such an onset and shift every pairing by one beat.
+        let analyzed: Vec<u64> = onsets
+            .iter()
+            .map(|&o| o as u64)
+            .filter(|&o| o + bf / 2 >= wf && o + bf / 2 < total)
+            .collect();
 
         // Anti-stub (§6.1): exact expected click count — 16 per wrap, every
         // analyzed wrap. A silent or stalled track fails here, not in sync math.
@@ -243,6 +260,18 @@ fn t_seam_metronome_onset_grid_all_rates() {
              (drift) present: {:?}…",
             offsets.len(),
             &offsets[..LOOP_BEATS as usize]
+        );
+
+        // Absolute-grid constant (§6.3b, ADR-094): BOTH paths must land on
+        // the derived grid itself, not merely a constant away from it. The
+        // uncompensated stretch path measured a constant 2880 here (the
+        // Signalsmith output latency — the C3 finding, ADR-093); the engine's
+        // feed-lead compensation must cancel it at every rate.
+        let median = median_offset(&offsets);
+        assert!(
+            median.abs() <= STRETCH_GRID_MEDIAN_MAX,
+            "rate {label}: absolute onset-grid median {median} exceeds \
+             ±{STRETCH_GRID_MEDIAN_MAX} — stretch-path pre-roll uncompensated"
         );
 
         // Bypass only (§6.3b "±0"): the output is a bit-exact copy of the
@@ -386,8 +415,8 @@ fn t_seam_metronome_onset_grid_across_tempo_change() {
         // from the grid assertions; the COUNT gate below still spans the
         // transition, so a dropped or doubled click there cannot hide.
         let windows = [
-            ("before", wrap_frames(tempo_a), f_change),
-            ("after", f_change + wrap_frames(tempo_b), total),
+            ("before", wrap_frames(tempo_a), f_change, beat_frames(tempo_a)),
+            ("after", f_change + wrap_frames(tempo_b), total, beat_frames(tempo_b)),
         ];
 
         // Anti-stub count gate across the whole capture (minus wrap 0): one
@@ -400,20 +429,38 @@ fn t_seam_metronome_onset_grid_across_tempo_change() {
              — a click was lost or doubled somewhere (possibly at the change)"
         );
 
-        for (side, from, to) in windows {
-            let pred: Vec<u64> = grid.iter().copied().filter(|&g| g >= from && g < to).collect();
-            let got: Vec<u64> =
-                onsets.iter().map(|&o| o as u64).filter(|&o| o >= from && o < to).collect();
-            assert_eq!(
-                got.len(),
-                pred.len(),
-                "{label} ({side}): onset count {} != predicted {}",
-                got.len(),
+        let mut side_medians = [0i64; 2];
+        for (idx, (side, from, to, bf_side)) in windows.into_iter().enumerate() {
+            // Predicted beats of the window, half-beat-guarded at the open
+            // end so a beat whose detection would straddle the window edge
+            // is never demanded. Offsets are measured by NEAREST detected
+            // onset per predicted beat (ADR-094: compensated onsets straddle
+            // the grid, so positional pairing against a window cut is
+            // ambiguous at the edges). A lost click's nearest detection is
+            // the neighbouring beat — a full beat away, far outside the
+            // spread gate — so losses still fail loudly per beat (the global
+            // count gate above catches doubles).
+            let pred: Vec<u64> = grid
+                .iter()
+                .copied()
+                .filter(|&g| g >= from && g + bf_side / 2 < to)
+                .collect();
+            assert!(
+                pred.len() >= LOOP_BEATS as usize,
+                "{label} ({side}): analysis window too small ({} beats)",
                 pred.len()
             );
 
-            let offsets: Vec<i64> =
-                got.iter().zip(&pred).map(|(&o, &p)| o as i64 - p as i64).collect();
+            let offsets: Vec<i64> = pred
+                .iter()
+                .map(|&g| {
+                    onsets
+                        .iter()
+                        .map(|&o| o as i64 - g as i64)
+                        .min_by_key(|d| d.abs())
+                        .unwrap()
+                })
+                .collect();
             let spread = offsets.iter().max().unwrap() - offsets.iter().min().unwrap();
             assert!(
                 spread <= STRETCH_ONSET_JITTER_MAX,
@@ -436,7 +483,30 @@ fn t_seam_metronome_onset_grid_across_tempo_change() {
                 offsets.len(),
                 &offsets[..offsets.len().min(LOOP_BEATS as usize)]
             );
+
+            // Absolute-grid constant per side (§6.3b, ADR-094): on the
+            // derived grid itself on BOTH sides of the change. Before the
+            // engine's output-latency compensation, any change crossing the
+            // unity boundary stepped by ±2880 here (the C3 finding, ADR-093:
+            // measured +2861/+2865 on device) — the audible flam this gate
+            // exists to catch.
+            let median = median_offset(&offsets);
+            assert!(
+                median.abs() <= STRETCH_GRID_MEDIAN_MAX,
+                "{label} ({side}): absolute onset-grid median {median} exceeds \
+                 ±{STRETCH_GRID_MEDIAN_MAX} — stretch-path pre-roll uncompensated"
+            );
+            side_medians[idx] = median;
         }
+
+        // Step across the change (the device analyzer's C1 gate shape):
+        // offset before == offset after, within the same 2 ms class bound.
+        let step = side_medians[1] - side_medians[0];
+        assert!(
+            step.abs() <= STRETCH_GRID_MEDIAN_MAX,
+            "{label}: onset-grid median stepped {step} across the tempo change \
+             (gate ≤ {STRETCH_GRID_MEDIAN_MAX})"
+        );
     }
 }
 

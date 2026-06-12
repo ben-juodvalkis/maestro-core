@@ -68,23 +68,22 @@ mod thresholds {
     /// VALIDATION-THRESHOLD (C1): re-entry equality — stem B's median offset
     /// after restart (across the tempo change) vs before its stop.
     pub const RE_ENTRY_STEP_MAX: i64 = 96;
-    /// VALIDATION-THRESHOLD (C3, ADR-093): the stretch path's deterministic
-    /// pre-roll — Signalsmith preset_default output latency at 48 kHz (spec
-    /// §2.3#4; the dossier-verified 2880/2880 instance latency). Bypass
-    /// audio lands exactly on the derived grid; stretched audio lands this
-    /// CONSTANT late (spec §6.3(b) explicitly permits the stretch path "a
-    /// constant measured offset"). It is invisible to every cross-stem gate
-    /// (all stems of a song share O, so they cross the unity boundary
-    /// together — measured +0 samples cross-stem on the C3 UI capture) and
-    /// to the per-capture alignment constant. It becomes observable exactly
-    /// once: when a tempo change crosses the unity boundary, a stem's median
-    /// offset must step by THIS value — not 0, and not anything else (a
-    /// stale re-anchor still measures ~1.2k, outside 2880 ±
-    /// TEMPO_CHANGE_STEP_MAX, so the D7 negative control still fails).
-    /// Engine-side pre-roll compensation is filed as follow-up (it matters
-    /// for cross-song ghost stems, which can be stretched while host stems
-    /// run unity).
-    pub const STRETCH_PATH_PREROLL: i64 = 2880;
+    /// VALIDATION-THRESHOLD (C3, ADR-093; re-baselined to 0 by ADR-094): the
+    /// stretch path's pre-roll relative to the bypass grid — the expected
+    /// median-offset step when a tempo change crosses the UNITY boundary.
+    /// ADR-093 measured the uncompensated Signalsmith preset_default output
+    /// latency as a deterministic constant 2880 (spec §2.3#4) and pinned it
+    /// here. ADR-094 compensates it inside the engine (the stretch feed
+    /// leads the playhead by `output_latency` output frames in beat-units;
+    /// tempo changes re-anchor mid-stream under the one-block crossfade), so
+    /// stretched audio lands ON the derived grid at every rate and the
+    /// expected step is now THIS value — zero — within
+    /// TEMPO_CHANGE_STEP_MAX. NOT a loosening: an uncompensated engine
+    /// measures 2880 here and fails; a stale re-anchor still measures ~1.2k
+    /// and fails (the D7 negative control is intact); offline T-SEAM pins
+    /// the same zero absolutely (STRETCH_GRID_MEDIAN_MAX, measured medians
+    /// ≤ |42| at rates 0.75/1.5/2.0/1.67 — pre-fix: 2884).
+    pub const STRETCH_PATH_PREROLL: i64 = 0;
     /// VALIDATION-THRESHOLD (C1): minimum onsets per analysis window
     /// (pre/post-change, pre-stop/post-restart).
     pub const MIN_WINDOW_ONSETS: usize = 12;
@@ -349,21 +348,30 @@ struct Window {
     spread: i64,
 }
 
-/// Pair detected onsets (capture frames) sequentially with predicted grid
-/// frames (engine frames + alignment) and summarize.
-fn window_offsets(onsets: &[u64], grid: &[u64], align: i64) -> Option<Window> {
-    if onsets.is_empty() || onsets.len() != grid.len() {
+/// Alignment constant (engine frame → capture frame: ring + output-path
+/// latency) from detected onsets vs the predicted grid, paired by NEAREST
+/// grid beat over the region before `before`. Robust to missing edge
+/// onsets: with the ADR-094-compensated engine the FIRST beat's attack
+/// coincides with the activation ramp and is legitimately undetectable —
+/// index pairing would shift every downstream pair by one beat (measured on
+/// the offline smoke: a spurious +4800 "step" across the tempo change =
+/// exactly the beat-period difference, on a capture whose every onset sat
+/// within −9..−42 of the true grid). Assumes |true alignment| < half the
+/// local beat spacing: the capture path is a few-thousand-frame ring, beat
+/// spacing ≥ 9600 at the §4.8 tempo ceiling; the window-spread gates
+/// downstream catch a violation loudly.
+fn estimate_align(onsets: &[usize], grid: &[u64], before: u64) -> Option<i64> {
+    let beats: Vec<i64> = grid.iter().filter(|&&g| g < before).map(|&g| g as i64).collect();
+    let deltas: Vec<i64> = onsets
+        .iter()
+        .map(|&o| o as i64)
+        .filter(|&o| o < before as i64)
+        .map(|o| beats.iter().map(|&g| o - g).min_by_key(|d| d.abs()))
+        .collect::<Option<Vec<_>>>()?;
+    if deltas.len() < 2 {
         return None;
     }
-    let offsets: Vec<i64> = onsets
-        .iter()
-        .zip(grid)
-        .map(|(&o, &g)| o as i64 - g as i64 - align)
-        .collect();
-    let median = median(&offsets);
-    let slope = if offsets.len() >= 2 { linear_slope(&offsets) } else { 0.0 };
-    let spread = offsets.iter().max().unwrap() - offsets.iter().min().unwrap();
-    Some(Window { offsets, median, slope, spread })
+    Some(median(&deltas))
 }
 
 /// Zero-accumulation verdict for a window of offsets (the spec §6.1 rule:
@@ -443,10 +451,11 @@ fn main() -> ExitCode {
     let harness_report = arg(&args, "--harness-report");
     // C3 (ADR-093): the stems' original tempo, when the capture comes from a
     // library song (real-UI runs). Lets the timing analysis know whether a
-    // tempo change crosses the UNITY boundary — bypass sits exactly on the
-    // grid, stretch sits a deterministic pre-roll late (spec §6.3(b)), so
-    // the expected step across such a change is STRETCH_PATH_PREROLL, not 0.
-    // Absent for harness runs (cross-tempo stems never run unity): steps 0.
+    // tempo change crosses the UNITY boundary. Since ADR-094 the engine
+    // compensates the stretch path's output latency, so the expected step
+    // across such a change is STRETCH_PATH_PREROLL = 0, same as everywhere —
+    // the flag and the constant are retained as the regression pin: an
+    // uncompensated engine steps 2880 there and fails loudly.
     let stem_tempo_mbpm: Option<u64> =
         arg(&args, "--stem-tempo-mbpm").map(|v| v.parse().expect("--stem-tempo-mbpm must be an integer (milli-BPM)"));
     let report_out = arg(&args, "--report");
@@ -737,15 +746,42 @@ fn analyze_offset_pairs(
             gate("net-offset-step", false, "missing analyzable segments".into());
         }
     } else {
-        gate(
-            "zero-drift",
-            total_drift.abs() < thresholds::MAX_TOTAL_DRIFT_SAMPLES,
-            format!(
-                "offset slope {slope:.6} samples/onset ⇒ {total_drift:.3} samples over the capture \
-                 (gate: |drift| < {})",
-                thresholds::MAX_TOTAL_DRIFT_SAMPLES
-            ),
-        );
+        // Zero accumulation, the §6.1 rule (T-SEAM's, applied to the device
+        // cross gate by ADR-094): EXACT periodicity of the offset sequence
+        // is the primary assertion — one sample lost or gained anywhere
+        // breaks it, as does any slope — with the LS fit as the fallback
+        // for aperiodic captures. The LS fit over an exactly periodic
+        // pattern aliases with the partial-period remainder: measured
+        // −0.956 vs +0.029 on two device captures of the SAME exactly
+        // period-16 pattern differing by ONE detected onset (143 = 8.94
+        // periods vs 144 = 9.00) — the fit alone is a coin-flip on
+        // N mod period, strictly weaker than periodicity.
+        let period = (1..=thresholds::ONSET_PATTERN_PERIOD_MAX).find(|&p| {
+            offsets.len() > 2 * p
+                && offsets.iter().zip(offsets.iter().skip(p)).all(|(a, b)| a == b)
+        });
+        if let Some(p) = period {
+            gate(
+                "zero-drift",
+                true,
+                format!(
+                    "offsets exactly periodic (period {p}, {} onsets) — zero accumulation \
+                     (LS fit {total_drift:.3} is partial-period aliasing, ADR-094)",
+                    offsets.len()
+                ),
+            );
+        } else {
+            gate(
+                "zero-drift",
+                total_drift.abs() < thresholds::MAX_TOTAL_DRIFT_SAMPLES,
+                format!(
+                    "aperiodic within period ≤ {}; offset slope {slope:.6} samples/onset ⇒ \
+                     {total_drift:.3} samples over the capture (gate: |drift| < {})",
+                    thresholds::ONSET_PATTERN_PERIOD_MAX,
+                    thresholds::MAX_TOTAL_DRIFT_SAMPLES
+                ),
+            );
+        }
     }
 
     // ----------------------------------------------------------- spread gate
@@ -821,60 +857,49 @@ fn analyze_timing(
         count_diff.abs() <= 2,
         format!("stem A: {} onsets vs {} predicted beats", onsets_l.len(), grid.len()),
     );
-    let n_a = onsets_l.len().min(grid.len());
-    let a_on: Vec<u64> = onsets_l[skip..n_a].iter().map(|&o| o as u64).collect();
-    let a_grid: Vec<u64> = grid[skip..n_a].to_vec();
-
     // Alignment constant: engine frame → capture frame (ring + output path
-    // latency), estimated once from stem A's PRE-CHANGE window. Everything
-    // downstream is predicted-vs-measured through this single constant.
+    // latency), estimated once from stem A's PRE-CHANGE window by nearest-
+    // grid pairing (see estimate_align — robust to the ramp-silenced first
+    // beat of the ADR-094-compensated engine). Everything downstream is
+    // predicted-vs-measured through this single constant.
     //
     // Stem A is analyzed in three windows split at the engine's echoed
     // frames: [start, tempo change), [change, variation switch),
     // [variation, end). Each boundary is a legitimate vocoder re-phasing
-    // point (the change re-phases the hop grid; the swap re-anchors), so
-    // slope is gated per window and the boundary steps are gated by the
-    // median-equality thresholds — periodicity/slope, never per-onset
-    // constancy (T-SEAM's rule, spec §6.1).
+    // point (the change re-anchors under the one-block crossfade, ADR-094;
+    // the swap re-anchors), so slope is gated per window and the boundary
+    // steps are gated by the median-equality thresholds — periodicity/slope,
+    // never per-onset constancy (T-SEAM's rule, spec §6.1).
     let t_var = log.variation_at.unwrap_or(u64::MAX);
     gate(
         "variation-after-restart",
         log.variation_at.is_some_and(|v| v > b_restart),
         format!("VariationApplied at {:?} (must follow the restart, spec §6.4)", log.variation_at),
     );
-    let w1: Vec<usize> = (0..a_grid.len()).filter(|&i| a_grid[i] < t_change).collect();
-    let w2: Vec<usize> =
-        (0..a_grid.len()).filter(|&i| a_grid[i] >= t_change && a_grid[i] < t_var).collect();
-    let w3: Vec<usize> = (0..a_grid.len()).filter(|&i| a_grid[i] >= t_var).collect();
+    let Some(align) = estimate_align(&onsets_l, &grid, t_change) else {
+        gate("a-window-sizes", false, "no pre-change onsets for alignment".into());
+        return;
+    };
+    let wa1 = pair_window(&onsets_l, &grid, (0, t_change), align, skip);
+    let wa2 = pair_window(&onsets_l, &grid, (t_change, t_var), align, 1);
+    let wa3 = pair_window(&onsets_l, &grid, (t_var, u64::MAX), align, 1);
+    let (Some(a_pre), Some(a_mid), Some(a_post)) = (wa1, wa2, wa3) else {
+        gate("a-window-sizes", false, "a stem-A window had too few onsets".into());
+        return;
+    };
+    let (a_pre, a_mid, a_post) = (a_pre.window, a_mid.window, a_post.window);
     gate(
         "a-window-sizes",
-        w1.len() >= thresholds::MIN_WINDOW_ONSETS
-            && w2.len() >= thresholds::MIN_WINDOW_ONSETS
-            && w3.len() >= thresholds::MIN_WINDOW_ONSETS,
+        a_pre.offsets.len() >= thresholds::MIN_WINDOW_ONSETS
+            && a_mid.offsets.len() >= thresholds::MIN_WINDOW_ONSETS
+            && a_post.offsets.len() >= thresholds::MIN_WINDOW_ONSETS,
         format!(
             "stem A windows: {} pre-change, {} change→variation, {} post-variation onsets",
-            w1.len(),
-            w2.len(),
-            w3.len()
+            a_pre.offsets.len(),
+            a_mid.offsets.len(),
+            a_post.offsets.len()
         ),
     );
-    if w1.len() < 2 || w2.len() < 2 || w3.len() < 2 {
-        return;
-    }
-    let raw_pre: Vec<i64> = w1.iter().map(|&i| a_on[i] as i64 - a_grid[i] as i64).collect();
-    let align = median(&raw_pre);
-
-    let win = |idx: &[usize]| {
-        window_offsets(
-            &idx.iter().map(|&i| a_on[i]).collect::<Vec<_>>(),
-            &idx.iter().map(|&i| a_grid[i]).collect::<Vec<_>>(),
-            align,
-        )
-        .expect("stem A window")
-    };
-    let a_pre = win(&w1);
-    let a_mid = win(&w2);
-    let a_post = win(&w3);
 
     // Zero accumulation on both sides of the change (C1): exact periodicity
     // of the offset pattern (primary) or zero LS slope (fallback). Windows
@@ -900,12 +925,12 @@ fn analyze_timing(
         let (ok, detail) = zero_accumulation(w);
         gate(name, ok, detail);
     }
-    // Offset before == offset after the tempo change (C1) — except when the
-    // change crosses the UNITY boundary (C3, ADR-093): bypass lands exactly
-    // on the grid, stretch lands the deterministic pre-roll late (spec
-    // §6.3(b)), so the EXPECTED step is ±STRETCH_PATH_PREROLL there. This is
-    // an exact additional expectation, not a loosening: a stale re-anchor
-    // (~1.2k) is outside both windows and still fails.
+    // Offset before == offset after the tempo change (C1). When the change
+    // crosses the UNITY boundary (C3, ADR-093) the expected step is
+    // ±STRETCH_PATH_PREROLL — re-baselined to 0 by ADR-094's engine-side
+    // compensation, so the expectation is uniform; the explicit machinery
+    // stays as the regression pin (an uncompensated engine steps 2880 here;
+    // a stale re-anchor ~1.2k — both fail).
     let expected_flip_step = |mbpm_before: u64, mbpm_after: u64| -> i64 {
         match stem_tempo_mbpm {
             Some(o) if o == mbpm_before && o != mbpm_after => thresholds::STRETCH_PATH_PREROLL,
@@ -989,22 +1014,26 @@ fn analyze_timing(
         format!("{intruders} onsets inside B's stop window [{silent_lo}, {silent_hi}] (gate: 0)"),
     );
 
-    let n_pre = b_on_pre.len().min(b_grid_pre.len());
-    let n_post = b_on_post.len().min(b_grid_post.len());
+    // Nearest-grid pairing for the offset stats (estimate_align rationale);
+    // post-restart skips the first beat — it re-enters under the activation
+    // ramp (the count gates above still see it).
+    let wb_pre = pair_window(&onsets_r, &grid, (b_start, b_stop), align, skip);
+    let wb_post = pair_window(&onsets_r, &grid, (b_restart, u64::MAX), align, 1);
+    let (Some(b_pre), Some(b_post)) = (wb_pre, wb_post) else {
+        gate("b-window-sizes", false, "a stem-B window had too few onsets".into());
+        return;
+    };
+    let (b_pre, b_post) = (b_pre.window, b_post.window);
     gate(
         "b-window-sizes",
-        n_pre > skip + thresholds::MIN_WINDOW_ONSETS && n_post >= thresholds::MIN_WINDOW_ONSETS,
-        format!("stem B windows: {n_pre} pre-stop, {n_post} post-restart onsets"),
+        b_pre.offsets.len() >= thresholds::MIN_WINDOW_ONSETS
+            && b_post.offsets.len() >= thresholds::MIN_WINDOW_ONSETS,
+        format!(
+            "stem B windows: {} pre-stop, {} post-restart onsets",
+            b_pre.offsets.len(),
+            b_post.offsets.len()
+        ),
     );
-    if n_pre <= skip + 2 || n_post < 2 {
-        return;
-    }
-    let b_pre = window_offsets(&b_on_pre[skip..n_pre], &b_grid_pre[skip..n_pre], align)
-        .expect("B pre window");
-    // Post-restart: the first onset after re-entry is under the activation
-    // ramp; skip it from the offset stats (the count gates above still see it).
-    let b_post = window_offsets(&b_on_post[1..n_post], &b_grid_post[1..n_post], align)
-        .expect("B post window");
 
     // Re-entry equality (C1): same constant before the stop and after the
     // restart, across the tempo change that happened while B was silent —
@@ -1196,17 +1225,13 @@ fn analyze_control(
     if onsets_l.len() < n_pre_grid.min(grid.len()) {
         return;
     }
-    // align1 from A's pre-tempo-change window.
-    let a_pre_idx: Vec<usize> = (skip..n_pre_grid.min(onsets_l.len()))
-        .filter(|&i| grid[i] < t_tempo)
-        .collect();
-    if a_pre_idx.len() < 2 {
+    // align1 from A's pre-tempo-change window, nearest-grid paired (see
+    // estimate_align — index pairing breaks on the ramp-silenced first beat
+    // of the ADR-094-compensated engine).
+    let Some(align1) = estimate_align(&onsets_l, &grid, t_tempo) else {
         gate("a-window-sizes", false, "no pre-change onsets for alignment".into());
         return;
-    }
-    let raw_pre: Vec<i64> =
-        a_pre_idx.iter().map(|&i| onsets_l[i] as i64 - grid[i] as i64).collect();
-    let align1 = median(&raw_pre);
+    };
     // align2 from A's post-resume onsets (sequential pairing).
     let post_grid: Vec<u64> = grid.iter().copied().filter(|&g| g >= f_pause).collect();
     let a_post_on: Vec<u64> = onsets_l[n_pre_grid.min(onsets_l.len())..]
@@ -1314,17 +1339,25 @@ fn analyze_control(
         gate("b-window-sizes", false, "a stem-B window had too few onsets".into());
         return;
     };
-    for (name, w) in [
-        ("b-count-pre-mute", &wb1),
-        ("b-count-between", &wb2),
-        ("b-count-post-solo", &wb3),
-        ("b-count-post-tempo", &wb4),
-        ("b-count-post-resume", &wb5),
+    // Count tolerances: ±1 admits a window's re-entry boundary beat (it
+    // re-enters under the activation ramp; with the ADR-094-compensated
+    // engine its attack coincides with the boundary and can be legitimately
+    // undetectable — pre-compensation it emerged 60 ms later, past the
+    // ramp). The post-resume window is the capture's final window and
+    // accumulates BOTH the resume-ramp beat and the capture-edge truncation
+    // beat: ±2, matching a-post-pause-count and analyze_timing's
+    // post-restart gate.
+    for (name, w, tol) in [
+        ("b-count-pre-mute", &wb1, 1),
+        ("b-count-between", &wb2, 1),
+        ("b-count-post-solo", &wb3, 1),
+        ("b-count-post-tempo", &wb4, 1),
+        ("b-count-post-resume", &wb5, 2),
     ] {
         gate(
             name,
-            (w.detected as i64 - w.expected as i64).abs() <= 1,
-            format!("{} onsets vs {} predicted", w.detected, w.expected),
+            (w.detected as i64 - w.expected as i64).abs() <= tol,
+            format!("{} onsets vs {} predicted (tolerance ±{tol})", w.detected, w.expected),
         );
     }
     // Re-entry equality across each silenced window (the §3.2 claim: silence

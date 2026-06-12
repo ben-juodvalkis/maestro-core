@@ -269,6 +269,12 @@ pub struct TrackState {
     /// Preallocated by the control plane; `anchor` and `process` never allocate.
     stretcher: Box<Stretcher>,
     needs_anchor: bool,
+    /// Set with `needs_anchor` by a tempo change that re-anchors a warm
+    /// mid-stream stretch track (ADR-094): the OLD tempo, letting the next
+    /// render fade out one final block of the old feed schedule from the
+    /// still-warm stretcher (waveform-continuous) against the fresh anchor.
+    /// Consumed (taken) on the very next render of the track.
+    reanchor_fade_tempo: Option<u32>,
     ramp_remaining: u32,
     last_wrap_count: u64,
     /// Interleaved scratch, capacity `MAX_FEED_FRAMES * 2`.
@@ -323,6 +329,7 @@ impl TrackState {
             retired_pcm: None,
             stretcher,
             needs_anchor: true,
+            reanchor_fade_tempo: None,
             ramp_remaining: 0,
             last_wrap_count: 0,
             feed_scratch: vec![0.0; MAX_FEED_FRAMES * 2],
@@ -363,7 +370,10 @@ impl TrackState {
 
     /// One-time anchor (spec §3.2): prime the stretcher with a seek window of
     /// `input_latency + output_latency` source frames ending at
-    /// `u(F₀) + input_latency`, then stream. Runs on the audio thread but
+    /// `n0 + input_latency`, then stream. `n0` is the compensated feed origin
+    /// `u(bu(F₀) + E·output_latency)` (ADR-094) — leading the playhead by the
+    /// vocoder's constant output latency so stretched output lands on the
+    /// derived grid, not 60 ms behind it. Runs on the audio thread but
     /// touches only preallocated scratch.
     fn anchor(&mut self, n0: u64, rate: f64) {
         self.stretcher.reset();
@@ -687,7 +697,38 @@ impl AudioCore {
                     }
                 }
                 RtCommand::SetTempo { mbpm } => {
+                    let prev = self.timeline.tempo_mbpm_at(self.frame);
                     if self.timeline.set_tempo(self.frame, mbpm).is_ok() {
+                        if mbpm != prev {
+                            // ADR-094: the stretch path's compensated feed
+                            // schedule is a function of the current tempo
+                            // (bu + E·out_lat), so a tempo change re-derives
+                            // it discontinuously — feeding across that seam
+                            // steps audibly mid-vocoder-window (measured
+                            // 3.5× the T-SEAM bound on a pure sine). Tracks
+                            // rendering the stretch path at the NEW tempo
+                            // re-anchor instead; render_track masks the
+                            // mid-stream re-anchor with the same one-block
+                            // 1:1 crossfade as the unity↔stretch
+                            // transitions. Tracks entering unity keep their
+                            // warm stretcher for the stretch→unity fade.
+                            for ts in self.tracks.iter_mut().flatten() {
+                                if ts.map.original_tempo_mbpm() != mbpm
+                                    || ts.pitch_semitones != 0.0
+                                {
+                                    ts.needs_anchor = true;
+                                    if ts.prev_unity == Some(false) {
+                                        // Warm mid-stream stretch: the next
+                                        // render fades out one final block
+                                        // of the OLD feed schedule.
+                                        // get_or_insert: with two changes
+                                        // at one boundary the stream is
+                                        // still on the OLDEST schedule.
+                                        ts.reanchor_fade_tempo.get_or_insert(prev);
+                                    }
+                                }
+                            }
+                        }
                         // Tempo echo (spec §3.1): the exact application frame,
                         // for the device analyzer's predicted onset grid.
                         push_event(
@@ -1061,6 +1102,10 @@ fn render_track(
     if b == 0 {
         return;
     }
+    // Pending mid-stream re-anchor fade (ADR-094): valid for exactly the
+    // first render after the tempo change that set it — taken
+    // unconditionally so it can never go stale across silence or restarts.
+    let reanchor_fade_tempo = ts.reanchor_fade_tempo.take();
     // Unity means O == E **exactly** (integer compare, spec §3.2) and no
     // pitch shift — a pitch-shifted track is promoted to the stretch path.
     #[allow(unused_mut)]
@@ -1072,6 +1117,28 @@ fn render_track(
         let n0 = ts.dictated_u(bu0);
         let n1 = ts.dictated_u(bu1);
         (n0, (n1 - n0) as usize)
+    };
+
+    // Stretch-path feed positions — output-latency compensation (ADR-094).
+    // The vocoder delays its output by a constant `output_latency` OUTPUT
+    // frames (deterministic per spec §2.3#4: 2880 at 48 kHz preset_default),
+    // so a stretch feed evaluated at bu lands every onset 60 ms behind the
+    // bypass grid — audible whenever a stretched stem plays against a unity
+    // stem (cross-song ghost stems; the C3 finding, ADR-093). The stretch
+    // feed therefore evaluates the SAME derived map `output_latency` output
+    // frames ahead: bu + E·out_lat. Recomputed each block from the current
+    // tempo, the lead is exactly out_lat output frames at every rate (never
+    // a baked-in rate-scaled source count); spans telescope at constant
+    // tempo. The schedule is a function of E, so a tempo change re-derives
+    // it discontinuously — the SetTempo handler re-anchors stretch tracks
+    // under the one-block crossfade (see the fade arm below) rather than
+    // feeding across the seam. Positions are untouched: this shifts only
+    // which CONTENT the stretcher is fed, never what u(F) reports.
+    #[allow(unused_mut)]
+    let (mut n0_s, mut span_s) = {
+        let lead = ts.stretcher.output_latency() as u128 * tempo_mbpm as u128;
+        let a = ts.dictated_u(bu0 + lead);
+        (a, (ts.dictated_u(bu1 + lead) - a) as usize)
     };
 
     #[cfg(feature = "drift-injection")]
@@ -1089,17 +1156,26 @@ fn render_track(
     #[cfg(feature = "drift-injection")]
     if crate::sabotage::mode() == crate::sabotage::Sabotage::FloatCursor {
         // Defect class D1: a per-track position *advanced* each block. The
-        // cursor is seeded from the derived position on first use, then free-runs.
+        // cursor is seeded from the derived position on first use, then
+        // free-runs — the sabotaged feed follows it verbatim (no lead: the
+        // defect being simulated predates the compensation).
         let rate = tempo_mbpm as f32 / ts.map.original_tempo_mbpm() as f32;
         let c0 = ts.float_cursor.unwrap_or(ts.map.u(bu0) as f32);
         let c1 = c0 + b as f32 * rate;
         ts.float_cursor = Some(c1);
         n0 = c0 as u64;
         span = (c1 as u64 - c0 as u64) as usize;
+        n0_s = n0;
+        span_s = span;
     }
 
     debug_assert!(span <= MAX_FEED_FRAMES);
-    let span = span.min(MAX_FEED_FRAMES);
+    debug_assert!(span_s <= MAX_FEED_FRAMES);
+    let span_s = span_s.min(MAX_FEED_FRAMES);
+    // The un-led dictated span only backs the unity bypass identity check
+    // below, which the drift-injection build disables.
+    #[cfg(feature = "drift-injection")]
+    let _ = span;
 
     // ---- Crossfade fade-out source (spec §3.2: one-block, equal-power). ----
     // A variation swap takes priority (its discontinuity subsumes any path
@@ -1117,26 +1193,70 @@ fn render_track(
         fade_out = true;
     } else {
         match ts.prev_unity {
-            Some(true) if !unity => {
-                // bypass → stretch: fade out the bypass continuation (1:1
-                // from n0 — content-continuous with the previous block).
-                let mut scratch = std::mem::take(&mut ts.xfade_scratch);
-                ts.read_source(n0, b, &mut scratch);
-                ts.xfade_scratch = scratch;
-                fade_out = true;
+            Some(prev_was_unity) if !unity && (prev_was_unity || ts.needs_anchor) => {
+                match (prev_was_unity, reanchor_fade_tempo) {
+                    (false, Some(old_tempo)) => {
+                        // Mid-stream stretch re-anchor (tempo change,
+                        // ADR-094): fade out one FINAL block of the old feed
+                        // schedule from the still-warm stretcher — waveform-
+                        // continuous with the previous block (a 1:1 source
+                        // read here would step against the vocoder's output;
+                        // measured 3.5× the T-SEAM seam bound). The main
+                        // path below then re-anchors on the new schedule
+                        // under the fade-in — the same one-block shape as
+                        // the stretch→unity transition.
+                        let lead =
+                            ts.stretcher.output_latency() as u128 * old_tempo as u128;
+                        let a = ts.dictated_u(bu0 + lead);
+                        let span_old = (ts
+                            .dictated_u(bu0 + old_tempo as u128 * b as u128 + lead)
+                            - a) as usize;
+                        let span_old = span_old.min(MAX_FEED_FRAMES);
+                        if span_old > 0 {
+                            let read_from = a + ts.stretcher.input_latency() as u64;
+                            let mut feed = std::mem::take(&mut ts.feed_scratch);
+                            ts.read_source(read_from, span_old, &mut feed);
+                            ts.feed_scratch = feed;
+                            let mut scratch = std::mem::take(&mut ts.xfade_scratch);
+                            let _ = ts.stretcher.process_interleaved(
+                                &ts.feed_scratch[..span_old * 2],
+                                &mut scratch[..b * 2],
+                            );
+                            ts.xfade_scratch = scratch;
+                            fade_out = true;
+                        }
+                    }
+                    _ => {
+                        // bypass → stretch (or a re-anchor whose predecessor
+                        // was not a warm stretch stream — e.g. a variation
+                        // swap applied while paused, masked by the resume
+                        // ramp): fade out the 1:1 continuation from n0 —
+                        // content-continuous with the previous block. At
+                        // stretch rates these ≤ 10 ms play at source rate
+                        // under the half-power tail — masked, like the
+                        // variation-swap fade.
+                        let mut scratch = std::mem::take(&mut ts.xfade_scratch);
+                        ts.read_source(n0, b, &mut scratch);
+                        ts.xfade_scratch = scratch;
+                        fade_out = true;
+                    }
+                }
             }
-            Some(false) if unity && span > 0 && !ts.needs_anchor => {
+            Some(false) if unity && span_s > 0 && !ts.needs_anchor => {
                 // stretch → unity: fade out one more streamed stretch block
                 // (at unity the dictated span == b, so the ratio is already
                 // 1:1); the stretcher is then left until the next anchor.
-                let read_from = n0 + ts.stretcher.input_latency() as u64;
+                // The compensated feed keeps its content grid-aligned with
+                // the incoming bypass — the crossfade joins two signals at
+                // the SAME musical position (ADR-094).
+                let read_from = n0_s + ts.stretcher.input_latency() as u64;
                 let mut feed = std::mem::take(&mut ts.feed_scratch);
-                ts.read_source(read_from, span, &mut feed);
+                ts.read_source(read_from, span_s, &mut feed);
                 ts.feed_scratch = feed;
                 let mut scratch = std::mem::take(&mut ts.xfade_scratch);
                 let _ = ts
                     .stretcher
-                    .process_interleaved(&ts.feed_scratch[..span * 2], &mut scratch[..b * 2]);
+                    .process_interleaved(&ts.feed_scratch[..span_s * 2], &mut scratch[..b * 2]);
                 ts.xfade_scratch = scratch;
                 fade_out = true;
             }
@@ -1164,7 +1284,7 @@ fn render_track(
     } else {
         let rate = tempo_mbpm as f64 / ts.map.original_tempo_mbpm() as f64;
         if ts.needs_anchor {
-            ts.anchor(n0, rate);
+            ts.anchor(n0_s, rate);
             ts.needs_anchor = false;
         }
         // Pitch (spec §3.2): set_transpose_semitones, re-applied only when the
@@ -1174,26 +1294,27 @@ fn render_track(
             let _ = ts.stretcher.set_transpose_semitones(desired);
             ts.applied_pitch = Some(desired);
         }
-        // The seek window already primed input up to u + input_latency;
-        // streaming continues from there. Re-feeding from u would double-feed
-        // the overlap and delay every output by input_latency/rate — a
-        // rate-DEPENDENT lag that misaligns cross-tempo stems (measured:
-        // 720 samples between rates 2.0 and 1.33). The shift is a constant
-        // inside the position→content mapping; positions remain derived.
-        let n0 = n0 + ts.stretcher.input_latency() as u64;
-        if span == 0 {
+        // The seek window already primed input up to the compensated feed
+        // origin + input_latency; streaming continues from there. Re-feeding
+        // from the origin would double-feed the overlap and delay every
+        // output by input_latency/rate — a rate-DEPENDENT lag that misaligns
+        // cross-tempo stems (measured: 720 samples between rates 2.0 and
+        // 1.33). The shift is a constant inside the position→content
+        // mapping; positions remain derived.
+        let read_from = n0_s + ts.stretcher.input_latency() as u64;
+        if span_s == 0 {
             // Sub-frame source advance (only possible at extreme rate × tiny
             // block combinations outside M0's envelope). Hold silence for the
             // block rather than calling the stretcher with no input.
             ts.out_scratch[..b * 2].fill(0.0);
         } else {
             let mut feed = std::mem::take(&mut ts.feed_scratch);
-            ts.read_source(n0, span, &mut feed);
+            ts.read_source(read_from, span_s, &mut feed);
             ts.feed_scratch = feed;
             let mut out = std::mem::take(&mut ts.out_scratch);
             let _ = ts
                 .stretcher
-                .process_interleaved(&ts.feed_scratch[..span * 2], &mut out[..b * 2]);
+                .process_interleaved(&ts.feed_scratch[..span_s * 2], &mut out[..b * 2]);
             ts.out_scratch = out;
         }
         &ts.out_scratch[..b * 2]
