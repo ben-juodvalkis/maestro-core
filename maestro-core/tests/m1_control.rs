@@ -27,7 +27,7 @@ const PCM_LEN: u64 = 384_000;
 const BLOCK: usize = 480;
 
 fn engine_with_sine(tempo: u32, hz: f32) -> (ControlPlane, Box<AudioCore>) {
-    let (mut plane, core) = create_engine(EngineConfig {
+    let (mut plane, core) = create_engine(EngineConfig { pcm_budget_bytes: None,
         sample_rate: SAMPLE_RATE,
         initial_tempo_mbpm: tempo,
         beats_per_bar: 4,
@@ -46,7 +46,7 @@ fn engine_with_sine(tempo: u32, hz: f32) -> (ControlPlane, Box<AudioCore>) {
 }
 
 fn meta(slot: u8, variation: u8) -> LoadMeta {
-    LoadMeta {
+    LoadMeta { cache_only: false,
         sample_rate: 48_000,
         slot,
         original_tempo_mbpm: O_MBPM,
@@ -231,7 +231,7 @@ fn tempo_and_load_reject_out_of_range_rates() {
     let (l, r) = make_sine_pcm(768_000, 110.0);
     plane
         .load_pcm(
-            &LoadMeta {
+            &LoadMeta { cache_only: false,
                 sample_rate: 48_000,
                 slot: 1,
                 original_tempo_mbpm: 60_000,
@@ -263,7 +263,7 @@ fn tempo_and_load_reject_out_of_range_rates() {
     // Loading a track whose rate at the CURRENT tempo is out of range fails.
     let (l2, r2) = make_sine_pcm(192_000, 880.0);
     let res = plane.load_pcm(
-        &LoadMeta {
+        &LoadMeta { cache_only: false,
             sample_rate: 48_000,
             slot: 2,
             original_tempo_mbpm: 240_000, // rate at tempo 240k is 1.0 — fine…
@@ -281,7 +281,7 @@ fn tempo_and_load_reject_out_of_range_rates() {
     assert!(res.is_ok(), "in-range load must pass: {res:?}");
     let (l3, r3) = make_sine_pcm(1_536_000, 55.0);
     let res = plane.load_pcm(
-        &LoadMeta {
+        &LoadMeta { cache_only: false,
             sample_rate: 48_000,
             slot: 3,
             original_tempo_mbpm: 30_000, // rate at tempo 240k would be 8.0
@@ -308,7 +308,7 @@ fn next_bar_activation_on_boundary_is_immediate() {
     // 120 BPM, 4/4: one bar = 4 beats = 96_000 frames. Render exactly one
     // bar, then arm with NextBar — bu is exactly on the boundary, so the
     // activation must land at the current frame, not a bar later.
-    let (mut plane, mut core) = create_engine(EngineConfig {
+    let (mut plane, mut core) = create_engine(EngineConfig { pcm_budget_bytes: None,
         sample_rate: SAMPLE_RATE,
         initial_tempo_mbpm: 120_000,
         beats_per_bar: 4,

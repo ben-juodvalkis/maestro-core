@@ -75,7 +75,7 @@ fn render_capture_with_changes(
     total_frames: u64,
     tempo_changes: &[(u64, u32)],
 ) -> Vec<f32> {
-    let (mut plane, mut core) = create_engine(EngineConfig {
+    let (mut plane, mut core) = create_engine(EngineConfig { pcm_budget_bytes: None,
         sample_rate: SAMPLE_RATE,
         initial_tempo_mbpm: tempo_mbpm,
         beats_per_bar: 4,
@@ -83,7 +83,7 @@ fn render_capture_with_changes(
     .unwrap();
     plane
         .load_pcm(
-            &LoadMeta {
+            &LoadMeta { cache_only: false,
                 sample_rate: 48_000,
                 slot: 0,
                 original_tempo_mbpm: O_MBPM,

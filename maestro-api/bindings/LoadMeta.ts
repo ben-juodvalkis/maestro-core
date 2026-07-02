@@ -43,6 +43,14 @@ originalSamples: bigint,
  */
 variation: number, 
 /**
+ * §4.11 prewarm (ADR-098): park this file's PCM in the slot's variation
+ * cache WITHOUT switching to it. Requires an occupied slot (rejected on
+ * an empty one); identity/reconciliation validation is unchanged. If the
+ * engine has a pending async switch to exactly this variation, the load
+ * completes that switch instead. A park never touches the RT thread.
+ */
+cacheOnly: boolean, 
+/**
  * Initial gain/pan (same validation as SetGain/SetPan).
  */
 gain: number, pan: number, };

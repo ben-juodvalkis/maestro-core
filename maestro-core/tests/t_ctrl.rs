@@ -91,7 +91,7 @@ fn storm(seed: u64) {
         let (l, r) = make_sine_pcm(t.pcm_len, 220.0 * (variation as f32 + 1.0));
         plane
             .load_pcm(
-                &LoadMeta {
+                &LoadMeta { cache_only: false,
                     slot: slot as u8,
                     sample_rate: 48_000,
                     original_tempo_mbpm: t.o_mbpm,

@@ -59,7 +59,7 @@ const M4A_44K_PADDING: u32 = 896;
 const M4A_44K_RATE: u32 = 44_100;
 
 fn engine() -> (ControlPlane, Box<AudioCore>) {
-    create_engine(EngineConfig {
+    create_engine(EngineConfig { pcm_budget_bytes: None,
         sample_rate: SAMPLE_RATE,
         initial_tempo_mbpm: 120_000,
         beats_per_bar: 4,
@@ -68,7 +68,7 @@ fn engine() -> (ControlPlane, Box<AudioCore>) {
 }
 
 fn meta(slot: u8, variation: u8, original_samples: u64) -> LoadMeta {
-    LoadMeta {
+    LoadMeta { cache_only: false,
         slot,
         sample_rate: SAMPLE_RATE,
         original_tempo_mbpm: M4A_O_MBPM,
@@ -391,7 +391,7 @@ fn non_48k_file_fails_loudly() {
     );
 
     let (mut plane, _core) = engine();
-    let mut m = LoadMeta {
+    let mut m = LoadMeta { cache_only: false,
         slot: 0,
         sample_rate: rate,
         original_tempo_mbpm: M4A_O_MBPM,

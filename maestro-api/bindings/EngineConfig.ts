@@ -18,4 +18,11 @@ initialTempoMbpm: number,
  * Beats per bar from the song's time-signature metadata. The engine never
  * hardcodes 4/4 (spec §4.12); bar display derives from this.
  */
-beatsPerBar: number, };
+beatsPerBar: number, 
+/**
+ * §4.11 per-song PCM budget override in bytes (ADR-098). Omitted → the
+ * engine default of 96 MiB (native jetsam headroom). Composition roots
+ * pass a device-RAM-tiered value so a whole song's variations can stay
+ * resident for instant switching. Zero is rejected — never clamped.
+ */
+pcmBudgetBytes: bigint | null, };

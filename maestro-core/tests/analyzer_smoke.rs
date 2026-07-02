@@ -39,7 +39,7 @@ struct Stem {
 }
 
 fn render_scenario(stems: &[Stem], out_name: &str) {
-    let (mut plane, mut core) = create_engine(EngineConfig {
+    let (mut plane, mut core) = create_engine(EngineConfig { pcm_budget_bytes: None,
         sample_rate: SAMPLE_RATE,
         initial_tempo_mbpm: TEMPO,
         beats_per_bar: 4,
@@ -51,7 +51,7 @@ fn render_scenario(stems: &[Stem], out_name: &str) {
         assert_eq!(wav.sample_rate, SAMPLE_RATE);
         plane
             .load_pcm(
-                &LoadMeta {
+                &LoadMeta { cache_only: false,
                     sample_rate: 48_000,
                     slot: slot as u8,
                     original_tempo_mbpm: stem.o_mbpm,
@@ -193,7 +193,7 @@ fn render_timing_scenario(out_name: &str, report_name: &str) {
 }
 
 fn render_timing_script(script: &TimingScript, out_name: &str, report_name: &str) {
-    let (mut plane, mut core) = create_engine(EngineConfig {
+    let (mut plane, mut core) = create_engine(EngineConfig { pcm_budget_bytes: None,
         sample_rate: SAMPLE_RATE,
         initial_tempo_mbpm: TEMPO,
         beats_per_bar: 4,
@@ -205,7 +205,7 @@ fn render_timing_script(script: &TimingScript, out_name: &str, report_name: &str
         let wav = load_float_wav(&fixture_path(stem.fixture)).unwrap();
         plane
             .load_pcm(
-                &LoadMeta {
+                &LoadMeta { cache_only: false,
                     sample_rate: 48_000,
                     slot: slot as u8,
                     original_tempo_mbpm: stem.o_mbpm,
@@ -266,7 +266,7 @@ fn render_timing_script(script: &TimingScript, out_name: &str, report_name: &str
             T_VARIATION => {
                 plane
                     .load_pcm(
-                        &LoadMeta {
+                        &LoadMeta { cache_only: false,
                             sample_rate: 48_000,
                             slot: 0,
                             original_tempo_mbpm: script.var_o_mbpm,
@@ -374,7 +374,7 @@ const C_PAUSE: u64 = 52 * SAMPLE_RATE as u64;
 const C_RESUME: u64 = 56 * SAMPLE_RATE as u64;
 
 fn render_control_scenario(out_name: &str, report_name: &str) {
-    let (mut plane, mut core) = create_engine(EngineConfig {
+    let (mut plane, mut core) = create_engine(EngineConfig { pcm_budget_bytes: None,
         sample_rate: SAMPLE_RATE,
         initial_tempo_mbpm: TEMPO,
         beats_per_bar: 4,
@@ -389,7 +389,7 @@ fn render_control_scenario(out_name: &str, report_name: &str) {
         let wav = load_float_wav(&fixture_path(stem.fixture)).unwrap();
         plane
             .load_pcm(
-                &LoadMeta {
+                &LoadMeta { cache_only: false,
                     sample_rate: 48_000,
                     slot: slot as u8,
                     original_tempo_mbpm: stem.o_mbpm,
@@ -481,7 +481,7 @@ fn render_control_scenario(out_name: &str, report_name: &str) {
             if let maestro_api::Event::VariationLoadRequired { slot, variation } = e {
                 plane
                     .load_pcm(
-                        &LoadMeta {
+                        &LoadMeta { cache_only: false,
                             sample_rate: 48_000,
                             slot,
                             original_tempo_mbpm: 60_000,
@@ -569,7 +569,7 @@ struct SoakEdition {
 }
 
 fn render_soak_edition(ed: &SoakEdition) {
-    let (mut plane, mut core) = create_engine(EngineConfig {
+    let (mut plane, mut core) = create_engine(EngineConfig { pcm_budget_bytes: None,
         sample_rate: SAMPLE_RATE,
         initial_tempo_mbpm: TEMPO,
         beats_per_bar: 4,
@@ -584,7 +584,7 @@ fn render_soak_edition(ed: &SoakEdition) {
         let wav = load_float_wav(&fixture_path(stem.fixture)).unwrap();
         plane
             .load_pcm(
-                &LoadMeta {
+                &LoadMeta { cache_only: false,
                     sample_rate: 48_000,
                     slot: slot as u8,
                     original_tempo_mbpm: stem.o_mbpm,

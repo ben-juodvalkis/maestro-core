@@ -143,6 +143,9 @@ pub struct ControlPlane {
     /// Control-side mirrors; the authoritative runtime state is the audio
     /// core's. Owns the §4.11 variation caches.
     slots: [SlotState; MAX_TRACKS],
+    /// §4.11 budget actually enforced: the config override, or
+    /// [`PCM_BUDGET_BYTES`] when the config omits one (ADR-098).
+    pcm_budget_bytes: u64,
     /// Monotonic stamp source for the §4.11 least-recently-audible order.
     lru_clock: u64,
     /// RT event-queue drops already surfaced (spec §6.7).
@@ -189,6 +192,12 @@ pub fn create_engine(config: EngineConfig) -> Result<(ControlPlane, Box<AudioCor
     if config.beats_per_bar == 0 {
         return Err(EngineError::InvalidConfig { reason: "beats_per_bar must be ≥ 1".into() });
     }
+    // §4.11 budget override (ADR-098): rejected, never clamped.
+    if config.pcm_budget_bytes == Some(0) {
+        return Err(EngineError::InvalidConfig {
+            reason: "pcm_budget_bytes must be ≥ 1 byte (omit it for the 96 MiB default)".into(),
+        });
+    }
     let timeline = Timeline::new(config.initial_tempo_mbpm)
         .map_err(|e| EngineError::InvalidConfig { reason: e.to_string() })?;
 
@@ -211,6 +220,7 @@ pub fn create_engine(config: EngineConfig) -> Result<(ControlPlane, Box<AudioCor
         reclaim: rec_rx,
         snapshot,
         tempo_mbpm: config.initial_tempo_mbpm,
+        pcm_budget_bytes: config.pcm_budget_bytes.unwrap_or(PCM_BUDGET_BYTES),
         config,
         slots: std::array::from_fn(|_| SlotState::Empty),
         lru_clock: 0,
@@ -385,7 +395,7 @@ impl ControlPlane {
     /// audible CACHED variation (installed/audible ones are never evicted).
     fn enforce_pcm_budget(&mut self) {
         loop {
-            if self.pcm_bytes_in_use() <= PCM_BUDGET_BYTES {
+            if self.pcm_bytes_in_use() <= self.pcm_budget_bytes {
                 return;
             }
             // Globally oldest cached entry across all slots.
@@ -520,7 +530,11 @@ impl ControlPlane {
         // (spec §3.4) — anything else is a hard failure, because loop length
         // can never change underneath the timeline (kills D9/D10).
         if let SlotState::Loaded(l) = &self.slots[meta.slot as usize] {
-            if l.variation != meta.variation {
+            // Cross-variation identity + reconciliation-stability validation
+            // also applies to §4.11 cache-only prewarms (incl. re-loads of
+            // the installed variation) — a mismatch means a mis-tagged or
+            // mis-decoded file, never a curiosity.
+            if l.variation != meta.variation || meta.cache_only {
                 if l.o_mbpm != meta.original_tempo_mbpm
                     || l.loop_beats != meta.loop_beats
                     || l.original_samples != meta.original_samples
@@ -548,6 +562,26 @@ impl ControlPlane {
                         meta.variation, meta.slot, reconciliation, l.reconciliation,
                     ));
                 }
+            }
+            if l.variation != meta.variation {
+                // §4.11 prewarm (ADR-098): park in the slot's variation cache
+                // without swapping — the RT thread is never touched, so
+                // positions/digests are unaffected by construction. A pending
+                // async switch to exactly this variation completes instead
+                // (the user asked for it; parking would strand the switch).
+                if meta.cache_only && l.pending_variation != Some(meta.variation) {
+                    self.lru_clock += 1;
+                    let stamp = self.lru_clock;
+                    let SlotState::Loaded(l) = &mut self.slots[meta.slot as usize] else {
+                        unreachable!()
+                    };
+                    // A re-prewarm of an already-cached variation replaces
+                    // the entry (fresh stamp, fresh PCM).
+                    l.cached.retain(|(v, _, _)| *v != meta.variation);
+                    l.cached.push((meta.variation, pcm, stamp));
+                    self.enforce_pcm_budget();
+                    return Ok(reconciliation);
+                }
                 // Send first; the mirror mutates only on success (see
                 // switch_variation).
                 self.send(RtCommand::SwapVariation {
@@ -573,6 +607,23 @@ impl ControlPlane {
                 self.enforce_pcm_budget();
                 return Ok(reconciliation);
             }
+            if meta.cache_only {
+                // Cache-only load of the INSTALLED variation: already
+                // resident — no-op success. This must never fall through to
+                // the fresh-install path below, which resets the slot and
+                // wipes the §4.11 cache (the prewarm/switch race hazard,
+                // ADR-098).
+                return Ok(reconciliation);
+            }
+        }
+
+        // §4.11 prewarm requires an installed track — there is nothing to
+        // park against on an empty slot (ADR-098).
+        if meta.cache_only {
+            return Err(format!(
+                "cache-only load requires an installed track on slot {} (spec §4.11 prewarm)",
+                meta.slot
+            ));
         }
 
         // Per-track stretcher (spec §4.3), preconfigured and preallocated here

@@ -37,6 +37,12 @@ pub struct EngineConfig {
     /// Beats per bar from the song's time-signature metadata. The engine never
     /// hardcodes 4/4 (spec §4.12); bar display derives from this.
     pub beats_per_bar: u32,
+    /// §4.11 per-song PCM budget override in bytes (ADR-098). Omitted → the
+    /// engine default of 96 MiB (native jetsam headroom). Composition roots
+    /// pass a device-RAM-tiered value so a whole song's variations can stay
+    /// resident for instant switching. Zero is rejected — never clamped.
+    #[serde(default)]
+    pub pcm_budget_bytes: Option<u64>,
 }
 
 /// Transport side-effect policy for track activation/deactivation — the
@@ -186,6 +192,13 @@ pub struct LoadMeta {
     /// reconcile the same way — or the load fails loudly (spec §3.4).
     #[serde(default)]
     pub variation: u8,
+    /// §4.11 prewarm (ADR-098): park this file's PCM in the slot's variation
+    /// cache WITHOUT switching to it. Requires an occupied slot (rejected on
+    /// an empty one); identity/reconciliation validation is unchanged. If the
+    /// engine has a pending async switch to exactly this variation, the load
+    /// completes that switch instead. A park never touches the RT thread.
+    #[serde(default)]
+    pub cache_only: bool,
     /// Initial gain/pan (same validation as SetGain/SetPan).
     pub gain: f32,
     pub pan: f32,

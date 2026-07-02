@@ -32,7 +32,7 @@ const PCM_LEN: u64 = 384_000;
 const BLOCK: usize = 480;
 
 fn meta(slot: u8, variation: u8) -> LoadMeta {
-    LoadMeta {
+    LoadMeta { cache_only: false,
         slot,
         sample_rate: SAMPLE_RATE,
         original_tempo_mbpm: O_MBPM,
@@ -47,7 +47,7 @@ fn meta(slot: u8, variation: u8) -> LoadMeta {
 }
 
 fn engine_with_sine(hz: f32) -> (ControlPlane, Box<AudioCore>) {
-    let (mut plane, core) = create_engine(EngineConfig {
+    let (mut plane, core) = create_engine(EngineConfig { pcm_budget_bytes: None,
         sample_rate: SAMPLE_RATE,
         initial_tempo_mbpm: O_MBPM,
         beats_per_bar: 4,
@@ -230,7 +230,7 @@ fn metering_reports_rendered_contribution() {
 
 #[test]
 fn activate_auto_starts_stopped_transport_and_manual_does_not() {
-    let (mut plane, core) = create_engine(EngineConfig {
+    let (mut plane, core) = create_engine(EngineConfig { pcm_budget_bytes: None,
         sample_rate: SAMPLE_RATE,
         initial_tempo_mbpm: O_MBPM,
         beats_per_bar: 4,
@@ -415,13 +415,13 @@ fn eviction_above_budget_never_touches_the_installed_variation() {
     let bytes_per_variation = LONG_LEN * 2 * 4;
     assert!(bytes_per_variation < PCM_BUDGET_BYTES && 2 * bytes_per_variation > PCM_BUDGET_BYTES);
 
-    let (mut plane, mut core) = create_engine(EngineConfig {
+    let (mut plane, mut core) = create_engine(EngineConfig { pcm_budget_bytes: None,
         sample_rate: SAMPLE_RATE,
         initial_tempo_mbpm: 60_000,
         beats_per_bar: 4,
     })
     .unwrap();
-    let long_meta = |variation: u8| LoadMeta {
+    let long_meta = |variation: u8| LoadMeta { cache_only: false,
         slot: 0,
         sample_rate: SAMPLE_RATE,
         original_tempo_mbpm: 60_000,

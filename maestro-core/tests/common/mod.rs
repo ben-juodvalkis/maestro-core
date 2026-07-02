@@ -123,7 +123,7 @@ pub fn build_engine_select(
     tracks: &[ScenarioTrack],
     active_slots: &[usize],
 ) -> (ControlPlane, Box<AudioCore>) {
-    let (mut plane, core) = create_engine(EngineConfig {
+    let (mut plane, core) = create_engine(EngineConfig { pcm_budget_bytes: None,
         sample_rate: SAMPLE_RATE,
         initial_tempo_mbpm: tempo_mbpm,
         beats_per_bar: BEATS_PER_BAR,
@@ -133,7 +133,7 @@ pub fn build_engine_select(
         let (l, r) = make_sine_pcm(t.pcm_len, t.sine_hz);
         plane
             .load_pcm(
-                &LoadMeta {
+                &LoadMeta { cache_only: false,
                     sample_rate: 48_000,
                     slot: slot as u8,
                     original_tempo_mbpm: t.o_mbpm,
