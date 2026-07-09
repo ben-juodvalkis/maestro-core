@@ -455,6 +455,26 @@ maestro_render(core, buffers, frames)                          // C ABI, audio t
 - Adding an operation = one enum variant + one `match` arm in ControlPlane. CI's
   `cargo run -p maestro-api --bin gen-ts && git diff --exit-code` keeps all layers honest.
 
+**Schema-evolution law (ADR-100, from the prewarm-parks-as-swaps production
+bug):** a mode flag that flips a call between destructive and non-destructive
+behavior must ride a surface an old engine *rejects* — a new `Command`
+variant (unknown variants fail loudly at parse) or a handshake-gated field —
+never a serde-defaulted field an old engine silently *reinterprets*.
+`LoadMeta.cache_only` predates the law and stays, because the
+**schema-fingerprint handshake** now guards the whole class: the engine
+embeds, at its build time, a hash over the committed `bindings/` content
+(`maestro_api::SCHEMA_FINGERPRINT`, computed by build.rs; gen-ts writes the
+same value to `bindings/fingerprint.ts` for the app bundle); both transports
+surface it (wasm: the worklet `ready` message; native: the plugin's
+`getSchemaFingerprint`) and the backends assert equality at init — mismatch
+or absence is a hard init failure. Committed engine artifacts
+(`public/maestro/*`, `worklet/pkg/*`) are additionally gated in CI
+(`scripts/check-engine-artifact-freshness.sh`, fingerprint-compare — the
+wasm is not byte-reproducible across environments), and `BackendBase`
+carries a runtime park tripwire: a `cache_only` load that changes the
+audible variation without a recorded user switch intent aborts the parking
+loop and raises an error-grade event on the ADR-096 net.
+
 ### 3.7 `AudioBackend` and coordinator integration
 
 One TS interface, two implementations, zero platform forks in the coordinator:

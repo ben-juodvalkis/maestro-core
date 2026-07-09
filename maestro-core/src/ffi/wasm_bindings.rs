@@ -41,6 +41,18 @@ use wasm_bindgen::prelude::*;
 use crate::audio_core::{AudioCore, MAX_BLOCK_FRAMES};
 use crate::control_plane::{create_engine, ControlPlane};
 
+/// FR2 (ADR-100): the maestro-api schema fingerprint this engine artifact
+/// was built against, embedded at build time. The worklet forwards it on the
+/// `ready` notification; the backend hard-fails init on mismatch or absence
+/// — a stale committed wasm artifact must never silently reinterpret the
+/// schema (the ADR-098 park-as-swap production bug, PRD §2). The full magic
+/// string sits verbatim in the data section so the FR3 CI gate can extract
+/// it with a binary grep.
+#[wasm_bindgen]
+pub fn schema_fingerprint() -> String {
+    maestro_api::SCHEMA_FINGERPRINT.to_string()
+}
+
 fn json_result(result: maestro_api::CommandResult) -> String {
     serde_json::to_string(&result).expect("CommandResult serializes")
 }

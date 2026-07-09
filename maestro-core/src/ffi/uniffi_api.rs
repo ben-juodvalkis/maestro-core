@@ -45,6 +45,17 @@ enum Runtime {
     Transitioning,
 }
 
+/// FR2 (ADR-100): the maestro-api schema fingerprint this engine binary was
+/// built against, embedded at build time. Surfaced by the plugin's additive
+/// `getSchemaFingerprint`; `NativeBackend` hard-fails init on mismatch or
+/// absence — a stale MaestroCore.xcframework must never silently
+/// reinterpret the schema (the ADR-098 park-as-swap bug class, PRD §2).
+/// Read-only; never touches the engine.
+#[uniffi::export]
+pub fn schema_fingerprint() -> String {
+    maestro_api::SCHEMA_FINGERPRINT.to_string()
+}
+
 #[derive(Debug, uniffi::Error)]
 #[uniffi(flat_error)]
 pub enum MaestroFfiError {

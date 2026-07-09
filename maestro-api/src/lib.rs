@@ -23,6 +23,20 @@
 
 use serde::{Deserialize, Serialize};
 
+/// FR2 schema fingerprint machinery (ADR-100) — shared by build.rs (which
+/// embeds [`SCHEMA_FINGERPRINT`]) and gen-ts (which writes the app bundle's
+/// `bindings/fingerprint.ts` half of the handshake).
+pub mod fingerprint;
+
+/// The maestro-api schema fingerprint this build was compiled against
+/// (ADR-100): a hash over the committed `bindings/` content, computed by
+/// build.rs. Both transports expose it (wasm: `schema_fingerprint()` on the
+/// worklet `ready` message; native: the plugin's `getSchemaFingerprint`) and
+/// the backends hard-fail init on mismatch or absence — a stale committed
+/// engine artifact must never silently reinterpret the schema (PRD §2, the
+/// ADR-098 park-as-swap bug).
+pub const SCHEMA_FINGERPRINT: &str = env!("MAESTRO_SCHEMA_FINGERPRINT");
+
 /// Engine configuration passed to `init`. The engine sample rate is fixed at
 /// 48 kHz by design (spec §4.7); `sample_rate` exists so the shim's assertion
 /// is explicit, not implicit.
@@ -326,4 +340,53 @@ pub struct Snapshot {
     /// variations) — the §4.11 per-song budget gate reads this.
     pub pcm_bytes_in_use: u64,
     pub tracks: Vec<TrackSnap>,
+}
+
+#[cfg(test)]
+mod fingerprint_tests {
+    use std::path::Path;
+
+    use super::fingerprint::{
+        fingerprint_bindings, fingerprint_files, SCHEMA_FINGERPRINT_PREFIX,
+    };
+    use super::SCHEMA_FINGERPRINT;
+
+    /// Pins the build.rs `#[path]` share: the embedded constant must equal a
+    /// fresh recomputation over the same committed bindings.
+    #[test]
+    fn embedded_fingerprint_matches_recomputation() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("bindings");
+        let recomputed = fingerprint_bindings(&dir).expect("bindings dir fingerprints");
+        assert_eq!(SCHEMA_FINGERPRINT, recomputed);
+    }
+
+    /// The FR3 gate extracts the fingerprint from artifacts by grepping for
+    /// this exact shape — pin it.
+    #[test]
+    fn fingerprint_shape_is_greppable() {
+        let hex = SCHEMA_FINGERPRINT
+            .strip_prefix(SCHEMA_FINGERPRINT_PREFIX)
+            .expect("magic prefix present");
+        assert_eq!(hex.len(), 16);
+        assert!(hex.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+    }
+
+    /// Negative control: the fingerprint must MOVE under any content or
+    /// filename change — a hash blind to either would green-light skew.
+    #[test]
+    fn fingerprint_moves_under_content_and_name_changes() {
+        let base = vec![
+            ("A.ts".to_string(), b"export type A = 1;".to_vec()),
+            ("B.ts".to_string(), b"export type B = 2;".to_vec()),
+        ];
+        let original = fingerprint_files(&base);
+
+        let mut content_changed = base.clone();
+        content_changed[1].1 = b"export type B = 3;".to_vec();
+        assert_ne!(original, fingerprint_files(&content_changed));
+
+        let mut renamed = base;
+        renamed[1].0 = "C.ts".to_string();
+        assert_ne!(original, fingerprint_files(&renamed));
+    }
 }
