@@ -150,6 +150,17 @@ pub enum Command {
     /// decode and call `load_pcm`, and the swap applies on load completion —
     /// `Event::VariationApplied` signals it either way.
     SwitchVariation { slot: u8, variation: u8 },
+    /// FR17 (ADR-104): one-shot memory-pressure trim — evict PARKED (cached,
+    /// non-installed) variation PCM, least-recently-audible first, until
+    /// resident bytes ≤ `target_bytes`. Installed/audible PCM is never
+    /// touched and nothing crosses to the RT thread (this is
+    /// `enforce_pcm_budget` with an explicit target, control-plane only);
+    /// the CONFIGURED budget is unchanged — pressure is about *now*, later
+    /// switches may re-park lazily from the compressed cache. Each eviction
+    /// echoes `Event::VariationEvicted`. A new Command variant per the §3.6
+    /// schema-evolution law: an old engine REJECTS it loudly at parse
+    /// instead of silently reinterpreting it.
+    TrimPcmCache { target_bytes: u64 },
 }
 
 /// Activation-frame policy for [`Command::Activate`] (spec §3.1):

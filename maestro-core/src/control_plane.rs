@@ -341,6 +341,11 @@ impl ControlPlane {
             Command::SwitchVariation { slot, variation } => {
                 return self.switch_variation(*slot, *variation);
             }
+            Command::TrimPcmCache { target_bytes } => {
+                // FR17 (ADR-104): control-plane only — nothing here touches
+                // the RT thread, installed PCM, or the configured budget.
+                self.evict_lru_until(*target_bytes);
+            }
         }
         CommandResult::Ok
     }
@@ -394,8 +399,18 @@ impl ControlPlane {
     /// §4.11 eviction: above the per-song budget, drop the least-recently-
     /// audible CACHED variation (installed/audible ones are never evicted).
     fn enforce_pcm_budget(&mut self) {
+        self.evict_lru_until(self.pcm_budget_bytes);
+    }
+
+    /// The shared eviction loop: drop least-recently-audible CACHED entries
+    /// until resident ≤ `limit`. Callers: `enforce_pcm_budget` (the standing
+    /// §4.11 budget) and `Command::TrimPcmCache` (FR17 one-shot pressure
+    /// target). Installed PCM is structurally unevictable — only `cached`
+    /// entries are candidates — so a `limit` of 0 empties every slot cache
+    /// and stops.
+    fn evict_lru_until(&mut self, limit: u64) {
         loop {
-            if self.pcm_bytes_in_use() <= self.pcm_budget_bytes {
+            if self.pcm_bytes_in_use() <= limit {
                 return;
             }
             // Globally oldest cached entry across all slots.
