@@ -9,11 +9,18 @@ export type TrackSnap = { slot: number, status: TrackStatus,
 /**
  * Currently rendering variation (spec §3.5).
  */
-variation: number, gain: number, pan: number, muted: boolean, solo: boolean, loopCount: number, 
+variation: number, gain: number, pan: number, muted: boolean, solo: boolean, 
+/**
+ * The installed variation's loop length in beats. Per-variation since
+ * ADR-109 — flips together with `variation` at a switch. Display only.
+ */
+loopBeats: number, 
 /**
  * Derived from bu(F) mod Λ. Display only — floats never feed timing.
+ * Λ is per-variation (ADR-109): `loop_count`/`loop_progress` re-base
+ * (jump) across a length-changing variation switch.
  */
-loopProgress: number, 
+loopCount: number, loopProgress: number, 
 /**
  * Per-track level metering over the last rendered block (post gain/pan,
  * the track's contribution to the mix). Zero while inaudible.

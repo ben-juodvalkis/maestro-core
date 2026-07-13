@@ -66,7 +66,10 @@ fn storm(seed: u64) {
     let mut tempo_now = TEMPO0;
 
     // Bookkeeping for the snapshot-consistency gate.
-    let mut last_loop: Vec<Option<(u32, u32, f32)>> = vec![None; tracks.len()]; // (epoch, count, progress)
+    // (epoch, loop_beats, count, progress) — loop_beats scopes the
+    // monotonicity check to one variation's tenure: a length-changing switch
+    // (ADR-109) legitimately re-bases count AND progress.
+    let mut last_loop: Vec<Option<(u32, u32, u32, f32)>> = vec![None; tracks.len()];
 
     // Anti-stub counters.
     let mut commands_accepted = 0usize;
@@ -83,22 +86,41 @@ fn storm(seed: u64) {
     let mut block_i = 0usize;
 
     // Respond to async variation loads (spec §4.11): decode is the platform's
-    // job — here the platform is this closure, loading a same-identity sine.
+    // job — here the platform is this closure. Variations carry DIFFERENT
+    // per-variation loop lengths (ADR-109) around the installed baseline
+    // (÷4 / baseline / ×2, all self-consistent against the shared O), so the
+    // storm soaks length-changing swaps under the full T-INV checkpointing —
+    // dictated positions are Λ-independent, so the reference math is
+    // unchanged.
+    let var_geometry = |slot: usize, variation: u8| -> (u32, u64) {
+        let t = &tracks[slot];
+        let beats = match variation {
+            0 => t.loop_beats,
+            1 => t.loop_beats / 4,
+            _ => t.loop_beats * 2,
+        };
+        // Exact rounded loop identity: pcm_len = round(beats·K/O).
+        const K: u128 = 2_880_000_000;
+        let o = t.o_mbpm as u128;
+        let len = ((beats as u128 * K + o / 2) / o) as u64;
+        (beats, len)
+    };
     let respond_load = |plane: &mut maestro_core::control_plane::ControlPlane,
                         slot: usize,
                         variation: u8| {
         let t = &tracks[slot];
-        let (l, r) = make_sine_pcm(t.pcm_len, 220.0 * (variation as f32 + 1.0));
+        let (beats, len) = var_geometry(slot, variation);
+        let (l, r) = make_sine_pcm(len, 220.0 * (variation as f32 + 1.0));
         plane
             .load_pcm(
                 &LoadMeta { cache_only: false,
                     slot: slot as u8,
                     sample_rate: 48_000,
                     original_tempo_mbpm: t.o_mbpm,
-                    loop_beats: t.loop_beats,
+                    loop_beats: beats,
                     encoder_delay: 0,
                     end_padding: 0,
-                    original_samples: t.pcm_len,
+                    original_samples: len,
                     variation,
                     gain: 1.0,
                     pan: t.pan,
@@ -327,9 +349,15 @@ fn storm(seed: u64) {
             }
             for t in &snap.tracks {
                 let slot = t.slot as usize;
-                // loop_progress monotone within a wrap (same epoch + count).
-                if let Some((epoch, count, progress)) = last_loop[slot] {
-                    if epoch == snap.timeline_epoch && count == t.loop_count && playing && !paused
+                // loop_progress monotone within a wrap (same epoch + map +
+                // count — a length-changing variation switch re-bases both,
+                // ADR-109).
+                if let Some((epoch, beats, count, progress)) = last_loop[slot] {
+                    if epoch == snap.timeline_epoch
+                        && beats == t.loop_beats
+                        && count == t.loop_count
+                        && playing
+                        && !paused
                     {
                         assert!(
                             t.loop_progress >= progress - 1e-6,
@@ -340,7 +368,8 @@ fn storm(seed: u64) {
                         );
                     }
                 }
-                last_loop[slot] = Some((snap.timeline_epoch, t.loop_count, t.loop_progress));
+                last_loop[slot] =
+                    Some((snap.timeline_epoch, t.loop_beats, t.loop_count, t.loop_progress));
                 assert!((0.0..1.0 + 1e-6).contains(&t.loop_progress));
             }
         }

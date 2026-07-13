@@ -98,23 +98,38 @@ const MAX_PITCH_SEMITONES: f32 = 12.0;
 /// Gain accepted range (ADR-092): [0, 2] (unity + headroom); rejected outside.
 const MAX_GAIN: f32 = 2.0;
 
-/// Control-side mirror of an installed track: immutable musical identity (for
-/// variation-switch and §4.8 validation), the installed PCM, and the §4.11
-/// variation cache for this slot.
+/// A §4.11-cached (parked) variation. Carries its own timing map because
+/// variations of a stem may differ in loop length (ADR-109) — the map must
+/// travel with the PCM into any future swap, atomically.
+struct CachedVariation {
+    variation: u8,
+    pcm: Arc<PcmData>,
+    map: TrackTimeline,
+    /// Last-audible stamp — the §4.11 eviction order. Stamped when the
+    /// variation stops being current (or at load if never current).
+    last_audible: u64,
+}
+
+/// Control-side mirror of an installed track: the SHARED musical identity
+/// (`o_mbpm` + reconciliation case — hard-gated equal across variations),
+/// the installed variation's own timing map (per-variation since ADR-109),
+/// the installed PCM, and the §4.11 variation cache for this slot.
 struct LoadedSlot {
+    /// Original tempo, shared across all variations of the stem (hard gate):
+    /// `u(bu) = bu/O` must be variation-independent so a switch resumes at
+    /// the same global musical position.
     o_mbpm: u32,
-    loop_beats: u32,
-    original_samples: u64,
     variation: u8,
     /// §3.4#4: which reconciliation case fired for the first loaded file of
     /// this stem; later variations must match.
     reconciliation: Reconciliation,
+    /// The installed variation's timing map (loop_beats/Λ/pcm_len — may
+    /// differ per variation, ADR-109). Rotates with `current_pcm`.
+    map: TrackTimeline,
     /// The PCM currently installed in the audio core (Arc-shared with it).
     current_pcm: Arc<PcmData>,
-    /// Cached non-current variations: (variation, pcm, last-audible stamp).
-    /// Stamped when the variation stops being current (or at load if never
-    /// current) — the §4.11 eviction order.
-    cached: Vec<(u8, Arc<PcmData>, u64)>,
+    /// Cached non-current variations, each with its own map.
+    cached: Vec<CachedVariation>,
     /// §4.11 async switch: a requested variation awaiting platform load.
     pending_variation: Option<u8>,
 }
@@ -362,15 +377,19 @@ impl ControlPlane {
             l.pending_variation = None;
             return CommandResult::Ok; // already current — no-op
         }
-        if let Some(idx) = l.cached.iter().position(|(v, _, _)| *v == variation) {
+        if let Some(idx) = l.cached.iter().position(|c| c.variation == variation) {
             // Send first, mutate the control-side mirror only on success —
             // a rejected send (wasm full-queue case) must leave the mirror
-            // consistent with what the audio core actually received.
-            let pcm = Arc::clone(&l.cached[idx].1);
+            // consistent with what the audio core actually received. The
+            // cached entry's own map rides the command: lengths may differ
+            // per variation (ADR-109), and map + PCM must install atomically.
+            let pcm = Arc::clone(&l.cached[idx].pcm);
+            let map = l.cached[idx].map;
             if let Err(reason) = self.send(RtCommand::SwapVariation {
                 slot,
                 variation,
                 pcm: Arc::clone(&pcm),
+                map,
             }) {
                 return CommandResult::Rejected { reason };
             }
@@ -380,14 +399,20 @@ impl ControlPlane {
             let idx = l
                 .cached
                 .iter()
-                .position(|(v, _, _)| *v == variation)
+                .position(|c| c.variation == variation)
                 .expect("cached entry still present");
             l.cached.swap_remove(idx);
-            let outgoing = (l.variation, Arc::clone(&l.current_pcm));
+            let outgoing = CachedVariation {
+                variation: l.variation,
+                pcm: Arc::clone(&l.current_pcm),
+                map: l.map,
+                last_audible: stamp,
+            };
             l.current_pcm = pcm;
+            l.map = map;
             l.variation = variation;
             l.pending_variation = None;
-            l.cached.push((outgoing.0, outgoing.1, stamp));
+            l.cached.push(outgoing);
             self.enforce_pcm_budget();
         } else {
             l.pending_variation = Some(variation);
@@ -417,17 +442,18 @@ impl ControlPlane {
             let mut oldest: Option<(usize, usize, u64)> = None;
             for (s, state) in self.slots.iter().enumerate() {
                 if let SlotState::Loaded(l) = state {
-                    for (i, (_, _, stamp)) in l.cached.iter().enumerate() {
-                        if oldest.is_none_or(|(_, _, best)| *stamp < best) {
-                            oldest = Some((s, i, *stamp));
+                    for (i, c) in l.cached.iter().enumerate() {
+                        if oldest.is_none_or(|(_, _, best)| c.last_audible < best) {
+                            oldest = Some((s, i, c.last_audible));
                         }
                     }
                 }
             }
             let Some((s, i, _)) = oldest else { return }; // nothing evictable
             let SlotState::Loaded(l) = &mut self.slots[s] else { unreachable!() };
-            let (variation, _pcm, _) = l.cached.swap_remove(i);
-            self.pending_events.push(Event::VariationEvicted { slot: s as u8, variation });
+            let evicted = l.cached.swap_remove(i);
+            self.pending_events
+                .push(Event::VariationEvicted { slot: s as u8, variation: evicted.variation });
         }
     }
 
@@ -439,7 +465,7 @@ impl ControlPlane {
             .map(|s| match s {
                 SlotState::Loaded(l) => {
                     pcm_bytes(&l.current_pcm)
-                        + l.cached.iter().map(|(_, p, _)| pcm_bytes(p)).sum::<u64>()
+                        + l.cached.iter().map(|c| pcm_bytes(&c.pcm)).sum::<u64>()
                 }
                 SlotState::Empty => 0,
             })
@@ -538,35 +564,25 @@ impl ControlPlane {
         });
 
         // Variation switch (spec §3.2): loading a different variation into an
-        // occupied slot swaps the PCM engine-side (Arc swap + re-anchor +
-        // one-block crossfade at a block boundary) — also the completion path
-        // of an async SwitchVariation (§4.11). All variations of a stem must
-        // declare identical musical identity AND reconcile the same way
-        // (spec §3.4) — anything else is a hard failure, because loop length
-        // can never change underneath the timeline (kills D9/D10).
+        // occupied slot swaps the PCM + timing map engine-side (atomic Arc +
+        // map swap + re-anchor + one-block crossfade at a block boundary) —
+        // also the completion path of an async SwitchVariation (§4.11).
+        // Variations of a stem may differ in loop length (ADR-109) — each
+        // file's own loop identity was validated by `TrackTimeline::new`
+        // above — but they must share the original tempo `O` (so `u = bu/O`
+        // is variation-independent and a switch resumes at the same global
+        // musical position) AND reconcile the same way (spec §3.4#4).
         if let SlotState::Loaded(l) = &self.slots[meta.slot as usize] {
-            // Cross-variation identity + reconciliation-stability validation
-            // also applies to §4.11 cache-only prewarms (incl. re-loads of
-            // the installed variation) — a mismatch means a mis-tagged or
-            // mis-decoded file, never a curiosity.
+            // Shared-identity + reconciliation-stability validation also
+            // applies to §4.11 cache-only prewarms — a mismatch means a
+            // mis-tagged or mis-decoded file, never a curiosity.
             if l.variation != meta.variation || meta.cache_only {
-                if l.o_mbpm != meta.original_tempo_mbpm
-                    || l.loop_beats != meta.loop_beats
-                    || l.original_samples != meta.original_samples
-                {
+                if l.o_mbpm != meta.original_tempo_mbpm {
                     return Err(format!(
-                        "variation {} identity mismatch on slot {}: installed \
-                         (O={}, loop_beats={}, original_samples={}) \
-                         vs incoming (O={}, loop_beats={}, original_samples={}) — all variations \
-                         of a stem must be musically identical (spec §3.4)",
-                        meta.variation,
-                        meta.slot,
-                        l.o_mbpm,
-                        l.loop_beats,
-                        l.original_samples,
-                        meta.original_tempo_mbpm,
-                        meta.loop_beats,
-                        meta.original_samples,
+                        "variation {} identity mismatch on slot {}: installed O={} vs \
+                         incoming O={} — all variations of a stem must share the original \
+                         tempo (spec §3.4, ADR-109)",
+                        meta.variation, meta.slot, l.o_mbpm, meta.original_tempo_mbpm,
                     ));
                 }
                 if l.reconciliation != reconciliation {
@@ -575,6 +591,22 @@ impl ControlPlane {
                          reconciled as {:?} — reconciliation must be stable across variations \
                          (spec §3.4#4); the file is mis-tagged or mis-decoded",
                         meta.variation, meta.slot, reconciliation, l.reconciliation,
+                    ));
+                }
+                // A re-load of the INSTALLED variation index must agree with
+                // what is installed — a length change under the same index is
+                // a mis-tagged file, never a curiosity (ADR-109).
+                if l.variation == meta.variation && l.map != map {
+                    return Err(format!(
+                        "variation {} re-load on slot {} declares loop_beats={} / \
+                         pcm_len={} but the installed copy has loop_beats={} / pcm_len={} — \
+                         the file is mis-tagged or mis-decoded (ADR-109)",
+                        meta.variation,
+                        meta.slot,
+                        map.loop_beats(),
+                        map.pcm_len(),
+                        l.map.loop_beats(),
+                        l.map.pcm_len(),
                     ));
                 }
             }
@@ -591,18 +623,25 @@ impl ControlPlane {
                         unreachable!()
                     };
                     // A re-prewarm of an already-cached variation replaces
-                    // the entry (fresh stamp, fresh PCM).
-                    l.cached.retain(|(v, _, _)| *v != meta.variation);
-                    l.cached.push((meta.variation, pcm, stamp));
+                    // the entry (fresh stamp, fresh PCM, fresh map).
+                    l.cached.retain(|c| c.variation != meta.variation);
+                    l.cached.push(CachedVariation {
+                        variation: meta.variation,
+                        pcm,
+                        map,
+                        last_audible: stamp,
+                    });
                     self.enforce_pcm_budget();
                     return Ok(reconciliation);
                 }
                 // Send first; the mirror mutates only on success (see
-                // switch_variation).
+                // switch_variation). The incoming map installs atomically
+                // with the PCM (ADR-109).
                 self.send(RtCommand::SwapVariation {
                     slot: meta.slot,
                     variation: meta.variation,
                     pcm: Arc::clone(&pcm),
+                    map,
                 })?;
                 self.lru_clock += 1;
                 let stamp = self.lru_clock;
@@ -611,10 +650,17 @@ impl ControlPlane {
                 };
                 // The outgoing current variation goes to the §4.11 cache; a
                 // re-load of an already-cached variation replaces the entry.
-                let outgoing = (l.variation, Arc::clone(&l.current_pcm), stamp);
-                l.cached.retain(|(v, _, _)| *v != outgoing.0 && *v != meta.variation);
+                let outgoing = CachedVariation {
+                    variation: l.variation,
+                    pcm: Arc::clone(&l.current_pcm),
+                    map: l.map,
+                    last_audible: stamp,
+                };
+                l.cached
+                    .retain(|c| c.variation != outgoing.variation && c.variation != meta.variation);
                 l.cached.push(outgoing);
                 l.current_pcm = pcm;
+                l.map = map;
                 l.variation = meta.variation;
                 if l.pending_variation == Some(meta.variation) {
                     l.pending_variation = None;
@@ -665,10 +711,9 @@ impl ControlPlane {
         self.send(RtCommand::InstallTrack { slot: meta.slot, state })?;
         self.slots[meta.slot as usize] = SlotState::Loaded(Box::new(LoadedSlot {
             o_mbpm: meta.original_tempo_mbpm,
-            loop_beats: meta.loop_beats,
-            original_samples: meta.original_samples,
             variation: meta.variation,
             reconciliation,
+            map,
             current_pcm: pcm,
             cached: Vec::new(),
             pending_variation: None,
@@ -694,6 +739,7 @@ impl ControlPlane {
                 pan: t.pan,
                 muted: t.muted,
                 solo: t.solo,
+                loop_beats: t.loop_beats,
                 loop_count: t.loop_count,
                 loop_progress: t.loop_progress,
                 rms_l: t.rms_l,

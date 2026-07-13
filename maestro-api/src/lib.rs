@@ -202,7 +202,10 @@ pub struct LoadMeta {
     pub sample_rate: u32,
     /// Track's original tempo in milli-BPM (integer; never 0 — load fails).
     pub original_tempo_mbpm: u32,
-    /// Exact musical loop length in beats (integer; authoritative for wrapping).
+    /// Exact musical loop length in beats (integer; authoritative for
+    /// wrapping). Per FILE, not per stem (ADR-109): variations of a stem may
+    /// declare different loop lengths, each validated against its own
+    /// `original_samples`.
     pub loop_beats: u32,
     /// Encoded file's measured priming/padding (per file, not per stem).
     pub encoder_delay: u32,
@@ -210,11 +213,13 @@ pub struct LoadMeta {
     /// Real audio length in samples as authored (pre-encode).
     pub original_samples: u64,
     /// Variation index of this file. Loading a different variation into an
-    /// occupied slot performs an engine-side variation switch (Arc PCM swap +
-    /// re-anchor + one-block crossfade at a block boundary, spec §3.2); all
-    /// variations of a stem must declare identical musical identity
-    /// (`loop_beats` / `original_samples` / `original_tempo_mbpm`) — and
-    /// reconcile the same way — or the load fails loudly (spec §3.4).
+    /// occupied slot performs an engine-side variation switch (atomic PCM +
+    /// timing-map swap + re-anchor + one-block crossfade at a block boundary,
+    /// spec §3.2). All variations of a stem must share `original_tempo_mbpm`
+    /// and reconcile the same way — or the load fails loudly (spec §3.4) —
+    /// but `loop_beats`/`original_samples` are per file and may differ
+    /// (ADR-109): the incoming variation resumes at the derived position
+    /// `bu(F) mod Λ_new`, as if it had been playing since timeline zero.
     #[serde(default)]
     pub variation: u8,
     /// §4.11 prewarm (ADR-098): park this file's PCM in the slot's variation
@@ -268,6 +273,9 @@ pub enum Event {
     /// A cached (non-audible) variation was evicted under the §4.11 per-song
     /// PCM budget.
     VariationEvicted { slot: u8, variation: u8 },
+    /// Display/diagnostic only. `wrap_count = floor(bu/Λ)` where Λ is the
+    /// INSTALLED variation's loop length — per-variation since ADR-109, so
+    /// the count re-bases (jumps) across a length-changing variation switch.
     LoopWrapped { slot: u8, wrap_count: u32 },
     Underrun,
     BudgetExceeded { render_ns: u64, period_ns: u64 },
@@ -310,8 +318,13 @@ pub struct TrackSnap {
     pub pan: f32,
     pub muted: bool,
     pub solo: bool,
-    pub loop_count: u32,
+    /// The installed variation's loop length in beats. Per-variation since
+    /// ADR-109 — flips together with `variation` at a switch. Display only.
+    pub loop_beats: u32,
     /// Derived from bu(F) mod Λ. Display only — floats never feed timing.
+    /// Λ is per-variation (ADR-109): `loop_count`/`loop_progress` re-base
+    /// (jump) across a length-changing variation switch.
+    pub loop_count: u32,
     pub loop_progress: f32,
     /// Per-track level metering over the last rendered block (post gain/pan,
     /// the track's contribution to the mix). Zero while inaudible.

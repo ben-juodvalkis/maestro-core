@@ -17,7 +17,9 @@
 //!    `decodeAudioData` behavior, found by the gate firing on the first M4
 //!    in-app WASM run (ADR-095); same bit-exact window verification;
 //! 4. wrong-length file → `TrackLoadFailed` naming every expected length;
-//! 5. variation set with one mismatched length → hard identity failure;
+//! 5. variation identity (ADR-109): differing per-variation lengths with a
+//!    shared original tempo load fine; a differing `O` or a self-inconsistent
+//!    file is a hard failure;
 //! 6. non-48k file → hard failure (the engine never resamples).
 //!
 //! Plus the M2 §3.4#4 extension: the reconciliation case is asserted STABLE
@@ -347,34 +349,52 @@ fn wrong_length_fails_with_both_expected_lengths_named() {
 }
 
 #[test]
-fn variation_set_with_mismatched_length_fails() {
+fn variation_identity_shared_o_and_per_file_self_consistency() {
     let (mut plane, _core) = engine();
     let (l, r) = make_sine_pcm(M4A_ORIGINAL_SAMPLES, 220.0);
     plane.load_pcm(&meta(0, 0, M4A_ORIGINAL_SAMPLES), l, r).expect("base variation loads");
 
-    // Variation 1 declares a self-consistent but DIFFERENT identity
-    // (8 beats @ 60 BPM = exactly 384_000): variation identity mismatch,
-    // hard failure (loop length can never change underneath the timeline).
+    // Variation 1 with a self-consistent DIFFERENT length (8 beats @ 60 BPM
+    // = exactly 384_000) and the SAME original tempo: loads and swaps —
+    // per-variation loop lengths are legal since ADR-109.
     let (l, r) = make_sine_pcm(384_000, 440.0);
     let mut m = meta(0, 1, 384_000);
     m.loop_beats = 8;
+    plane.load_pcm(&m, l, r).expect("different-length variation with shared O loads");
+    let events = plane.drain_events();
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, Event::TrackLoaded { slot: 0, variation: 1, .. })),
+        "the length-changing swap must ack: {events:?}"
+    );
+
+    // A variation declaring a DIFFERENT original tempo (self-consistent:
+    // 16 beats @ 120 BPM = exactly 384_000) is still a hard identity
+    // failure — u = bu/O must be variation-independent for the derived
+    // resume to hold.
+    let (l, r) = make_sine_pcm(384_000, 440.0);
+    let mut m = meta(0, 2, 384_000);
+    m.original_tempo_mbpm = 120_000;
+    m.loop_beats = 16;
     let err = plane.load_pcm(&m, l, r).unwrap_err();
     assert!(err.contains("identity mismatch"), "{err}");
+    assert!(err.contains("share the original tempo"), "{err}");
     expect_load_failed_event(&mut plane, 0, "identity");
 
-    // Variation 1 whose declared length contradicts its own musical identity
+    // A variation whose declared length contradicts its own musical identity
     // (768_000 − 1_024 against 16 beats @ 60): loop-identity failure — the
-    // other precise §3.4 reason.
+    // per-FILE half of the §3.4 rule is unchanged.
     let (l, r) = make_sine_pcm(M4A_ORIGINAL_SAMPLES - 1_024, 440.0);
     let err = plane
-        .load_pcm(&meta(0, 1, M4A_ORIGINAL_SAMPLES - 1_024), l, r)
+        .load_pcm(&meta(0, 2, M4A_ORIGINAL_SAMPLES - 1_024), l, r)
         .unwrap_err();
     assert!(err.contains("inconsistent with musical loop length"), "{err}");
 
-    // Variation 1 declares the right identity but its PCM is short: §3.4
+    // A variation declaring the right identity but with short PCM: §3.4
     // length mismatch, also hard.
     let (l, r) = make_sine_pcm(M4A_ORIGINAL_SAMPLES - 1_024, 440.0);
-    let err = plane.load_pcm(&meta(0, 1, M4A_ORIGINAL_SAMPLES), l, r).unwrap_err();
+    let err = plane.load_pcm(&meta(0, 2, M4A_ORIGINAL_SAMPLES), l, r).unwrap_err();
     assert!(err.contains("length mismatch"), "{err}");
 }
 

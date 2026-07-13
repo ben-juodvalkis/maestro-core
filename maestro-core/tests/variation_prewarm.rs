@@ -12,8 +12,9 @@
 //! - A cache-only load of the INSTALLED variation is a no-op success — it
 //!   must never reach the fresh-install path, which resets the slot and
 //!   wipes the cache (the prewarm/switch race hazard, ADR-098).
-//! - Identity + reconciliation-stability validation (spec §3.4) applies to
-//!   cache-only loads unchanged.
+//! - Shared-identity (`O`) + reconciliation-stability validation (spec §3.4,
+//!   ADR-109) applies to cache-only loads unchanged; per-variation lengths
+//!   park fine, but a same-index re-load with a changed length is rejected.
 //! - `EngineConfig.pcm_budget_bytes` overrides the 96 MiB default; parked
 //!   entries are evicted least-recently-audible first, installed PCM never.
 
@@ -246,6 +247,65 @@ fn cache_only_enforces_identity_and_reconciliation() {
 
     // Nothing was parked by either failure.
     assert_eq!(plane.snapshot().pcm_bytes_in_use, BYTES_PER_VARIATION);
+}
+
+#[test]
+fn park_with_different_length_same_o_succeeds() {
+    // ADR-109: a variation with a DIFFERENT self-consistent length (4 beats
+    // @ 120 BPM = exactly 96_000) and the shared O parks fine; the later
+    // switch takes the cached path and installs the entry's own map.
+    let (mut plane, mut core) = engine_with_sine(None, 220.0);
+    render_blocks(&mut core, 10);
+    plane.drain_events();
+
+    let short_len: u64 = 96_000;
+    let mut short = meta(0, 1, true);
+    short.loop_beats = 4;
+    short.original_samples = short_len;
+    let (l, r) = make_sine_pcm(short_len, 440.0);
+    plane.load_pcm(&short, l, r).expect("different-length park succeeds");
+    let events = plane.drain_events();
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            Event::VariationApplied { .. } | Event::VariationLoadRequired { .. }
+        )),
+        "a park must not apply or request anything: {events:?}"
+    );
+    assert_eq!(
+        plane.snapshot().pcm_bytes_in_use,
+        BYTES_PER_VARIATION + short_len * 2 * 4,
+        "per-entry byte accounting must use each variation's ACTUAL footprint"
+    );
+
+    assert!(matches!(
+        plane.dispatch(Command::SwitchVariation { slot: 0, variation: 1 }),
+        CommandResult::Ok
+    ));
+    render_blocks(&mut core, 2);
+    let events = plane.drain_events();
+    assert!(
+        !events.iter().any(|e| matches!(e, Event::VariationLoadRequired { .. })),
+        "different-length switch must take the cached path: {events:?}"
+    );
+    let snap = plane.snapshot();
+    assert_eq!(snap.tracks[0].variation, 1);
+    assert_eq!(snap.tracks[0].loop_beats, 4, "the parked entry's own map installs with it");
+}
+
+#[test]
+fn same_variation_park_with_changed_identity_rejected() {
+    // A cache-only re-load of the INSTALLED variation index that declares a
+    // different (even self-consistent) length is a mis-tagged file — hard
+    // reject, never a silent replace (ADR-109 tightening).
+    let (mut plane, _core) = engine_with_sine(None, 220.0);
+    let mut changed = meta(0, 0, true);
+    changed.loop_beats = 4;
+    changed.original_samples = 96_000;
+    let (l, r) = make_sine_pcm(96_000, 220.0);
+    let err = plane.load_pcm(&changed, l, r).expect_err("changed same-index identity rejected");
+    assert!(err.contains("mis-tagged"), "got: {err}");
+    assert_eq!(plane.snapshot().pcm_bytes_in_use, BYTES_PER_VARIATION, "nothing was parked");
 }
 
 #[test]

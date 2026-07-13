@@ -22,7 +22,10 @@ sampleRate: number,
  */
 originalTempoMbpm: number, 
 /**
- * Exact musical loop length in beats (integer; authoritative for wrapping).
+ * Exact musical loop length in beats (integer; authoritative for
+ * wrapping). Per FILE, not per stem (ADR-109): variations of a stem may
+ * declare different loop lengths, each validated against its own
+ * `original_samples`.
  */
 loopBeats: number, 
 /**
@@ -35,11 +38,13 @@ encoderDelay: number, endPadding: number,
 originalSamples: bigint, 
 /**
  * Variation index of this file. Loading a different variation into an
- * occupied slot performs an engine-side variation switch (Arc PCM swap +
- * re-anchor + one-block crossfade at a block boundary, spec §3.2); all
- * variations of a stem must declare identical musical identity
- * (`loop_beats` / `original_samples` / `original_tempo_mbpm`) — and
- * reconcile the same way — or the load fails loudly (spec §3.4).
+ * occupied slot performs an engine-side variation switch (atomic PCM +
+ * timing-map swap + re-anchor + one-block crossfade at a block boundary,
+ * spec §3.2). All variations of a stem must share `original_tempo_mbpm`
+ * and reconcile the same way — or the load fails loudly (spec §3.4) —
+ * but `loop_beats`/`original_samples` are per file and may differ
+ * (ADR-109): the incoming variation resumes at the derived position
+ * `bu(F) mod Λ_new`, as if it had been playing since timeline zero.
  */
 variation: number, 
 /**

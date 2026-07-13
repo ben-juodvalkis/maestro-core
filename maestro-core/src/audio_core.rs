@@ -95,8 +95,12 @@ pub enum RtCommand {
     SetPitch { slot: u8, semitones: f32 },
     /// Variation switch (spec §3.2): Arc PCM swap + re-anchor + one-block
     /// equal-power crossfade at the block boundary. The control plane has
-    /// already validated identical musical identity (spec §3.4).
-    SwapVariation { slot: u8, variation: u8, pcm: Arc<PcmData> },
+    /// already validated the shared identity (`O`, reconciliation case) and
+    /// each file's own loop identity (spec §3.4, ADR-109). `map` carries the
+    /// incoming variation's timing map so a length change installs atomically
+    /// with the PCM — loop length and read length can never be two
+    /// hand-synchronized values (the D9 guard, spec §2.3).
+    SwapVariation { slot: u8, variation: u8, pcm: Arc<PcmData>, map: TrackTimeline },
 }
 
 /// Edge events audio core → control plane. `Copy` so dropping on overflow
@@ -119,6 +123,10 @@ pub enum RtEvent {
     SoloApplied { slot: u8, solo: bool, at_frame: u64 },
     Removed { slot: u8 },
     VariationApplied { slot: u8, variation: u8, at_frame: u64 },
+    /// Display/diagnostic only. `wrap_count = floor(bu/Λ)` re-bases (jumps)
+    /// across a length-changing variation switch — Λ is per-variation
+    /// (ADR-109), so the count is comparable only within one variation's
+    /// tenure.
     LoopWrapped { slot: u8, wrap_count: u32 },
     BudgetExceeded { render_ns: u64, period_ns: u64 },
 }
@@ -200,6 +208,9 @@ pub struct RawTrackSnap {
     pub pan: f32,
     pub muted: bool,
     pub solo: bool,
+    /// The installed variation's loop length in beats — per-variation since
+    /// ADR-109 (flips together with `variation` at a switch). Display only.
+    pub loop_beats: u32,
     pub loop_count: u32,
     pub loop_progress: f32,
     pub rms_l: f32,
@@ -295,9 +306,13 @@ pub struct TrackState {
     /// one-block equal-power crossfade (spec §3.2). `None` after (re)entry —
     /// entries are masked by the activation ramp, not a crossfade.
     prev_unity: Option<bool>,
-    /// Outgoing PCM during a variation switch: the fade-out source for the
-    /// crossfade block, then handed to the reclaim queue (never dropped here).
-    xfade_old_pcm: Option<Arc<PcmData>>,
+    /// Outgoing (PCM, map) during a variation switch: the fade-out source for
+    /// the crossfade block, then the PCM is handed to the reclaim queue (never
+    /// dropped here). The outgoing map rides along because variations may have
+    /// different loop lengths (ADR-109) — the fade-out read must wrap at the
+    /// OUTGOING variation's Λ and bound by ITS pcm_len. `TrackTimeline` is
+    /// `Copy` with no heap, so dropping it here is RT-safe.
+    xfade_old: Option<(Arc<PcmData>, TrackTimeline)>,
     /// A retired PCM waiting for reclaim-queue space (overflow fallback).
     retired_pcm: Option<Arc<PcmData>>,
     /// Always provided (M1 tempo changes can move any track off unity).
@@ -360,7 +375,7 @@ impl TrackState {
             applied_pitch: None,
             pending_bu: None,
             prev_unity: None,
-            xfade_old_pcm: None,
+            xfade_old: None,
             retired_pcm: None,
             stretcher,
             needs_anchor: true,
@@ -901,17 +916,26 @@ impl AudioCore {
                         ts.pitch_semitones = semitones;
                     }
                 }
-                RtCommand::SwapVariation { slot, variation, pcm } => {
+                RtCommand::SwapVariation { slot, variation, pcm, map } => {
                     let frame = self.frame;
+                    let bu = self.timeline.bu(frame);
                     let rendering = self.playing && !self.paused;
                     if let Some(ts) = self.tracks.get_mut(slot as usize).and_then(Option::as_deref_mut) {
-                        let old = std::mem::replace(&mut ts.pcm, pcm);
+                        let old_pcm = std::mem::replace(&mut ts.pcm, pcm);
+                        let old_map = std::mem::replace(&mut ts.map, map);
                         ts.variation = variation;
                         ts.needs_anchor = true;
+                        // Λ may have changed (per-variation lengths, ADR-109):
+                        // re-base the wrap bookkeeping on the incoming map, or
+                        // a long→short switch burst-fires stale LoopWrapped
+                        // events and short→long silences them. Display/event
+                        // only — positions stay derived.
+                        ts.last_wrap_count = ts.map.wrap_count(bu);
                         if ts.active && rendering && ts.was_audible {
-                            // Crossfade against the outgoing PCM this block
-                            // (spec §3.2); it is reclaimed after the fade.
-                            if let Some(prev) = ts.xfade_old_pcm.replace(old) {
+                            // Crossfade against the outgoing (PCM, map) this
+                            // block (spec §3.2); the PCM is reclaimed after
+                            // the fade.
+                            if let Some((prev, _)) = ts.xfade_old.replace((old_pcm, old_map)) {
                                 // Double swap inside one block: the earlier
                                 // outgoing PCM never got its fade — reclaim it
                                 // (the loop guard guarantees a free slot).
@@ -919,7 +943,7 @@ impl AudioCore {
                             }
                         } else {
                             // Not audible: no crossfade — hand it back now.
-                            let _ = self.reclaim.push(Reclaimable::Pcm(old));
+                            let _ = self.reclaim.push(Reclaimable::Pcm(old_pcm));
                         }
                         push_event(
                             &mut self.events,
@@ -991,6 +1015,7 @@ impl AudioCore {
                     pan: ts.pan,
                     muted: ts.muted,
                     solo: ts.solo,
+                    loop_beats: ts.map.loop_beats(),
                     loop_count: ts.map.wrap_count(bu) as u32,
                     loop_progress: crate::timeline::loop_progress_display(&ts.map, bu),
                     rms_l: ts.meter.rms_l,
@@ -1065,7 +1090,8 @@ pub extern "C" fn maestro_set_sabotage(mode: u8) {
 /// into `dest` (interleaved stereo), following the beat-space Bresenham wrap.
 /// Copies contiguous runs — cost is O(wraps in span), not O(samples). Free
 /// function so the variation crossfade can read the *outgoing* PCM through
-/// the same (validated-identical) map.
+/// the *outgoing* variation's map (per-variation lengths, ADR-109); `pcm`
+/// must be the PCM this `map` was validated against.
 fn read_pcm(map: &TrackTimeline, pcm: &PcmData, n: u64, frames: usize, dest: &mut [f32]) {
     debug_assert!(dest.len() >= frames * 2);
     let l = &pcm.channel_data[0];
@@ -1218,12 +1244,16 @@ fn render_track(
     // the old and new render paths. Audio-only — positions are derived and
     // identical on both sides of every fade.
     let mut fade_out = false;
-    if let Some(old_pcm) = ts.xfade_old_pcm.as_ref() {
-        // Outgoing variation, read 1:1 through the (validated-identical) map.
-        // At stretch rates these ≤ 10 ms play at source rate under the
-        // half-power tail — masked, like the anchor smear (spec §3.2).
+    if let Some((old_pcm, old_map)) = ts.xfade_old.as_ref() {
+        // Outgoing variation, read 1:1 through the OUTGOING map — variations
+        // may differ in loop length (ADR-109), and `read_pcm` bounds by the
+        // map's pcm_len, so the old PCM must never be read through the new
+        // (possibly longer) map. `n0` is map-independent (shared O): the fade
+        // continues exactly what the old variation was playing. At stretch
+        // rates these ≤ 10 ms play at source rate under the half-power tail —
+        // masked, like the anchor smear (spec §3.2).
         let mut scratch = std::mem::take(&mut ts.xfade_scratch);
-        read_pcm(&ts.map, old_pcm, n0, b, &mut scratch);
+        read_pcm(old_map, old_pcm, n0, b, &mut scratch);
         ts.xfade_scratch = scratch;
         fade_out = true;
     } else {
@@ -1418,7 +1448,7 @@ fn render_track(
     // the audio thread). If a previous retiree is still waiting (reclaim
     // queue jammed), keep the fade source in place; the fade repeats next
     // block — degraded audio, never a drop.
-    if fade_out && ts.xfade_old_pcm.is_some() && ts.retired_pcm.is_none() {
-        ts.retired_pcm = ts.xfade_old_pcm.take();
+    if fade_out && ts.xfade_old.is_some() && ts.retired_pcm.is_none() {
+        ts.retired_pcm = ts.xfade_old.take().map(|(pcm, _)| pcm);
     }
 }
