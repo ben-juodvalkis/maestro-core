@@ -871,6 +871,15 @@ wrapper; add a preallocated-buffer process variant and the anchor helper; `proce
 per-call allocation is banned from the render path), `track.rs` (state machine + controls;
 **delete** `playback_position`/`advance_playback_position` — positions are not state).
 
+**Amended (2026-07-19)**: this section is the rebuild-era *plan*, not an inventory of the
+shipped engine — read it as history. Of the "keep as-is" list only `stretch.rs` survives as
+described: `timing.rs`, `pitch.rs`, `mixer.rs`, `transport.rs`, `events.rs` and `track.rs`
+were retired at ADR-095 deletion phase E. `pcm_cache.rs` survived that sweep *because* this
+line said to keep it, but the §3 engine was never wired to it — the control plane owns the
+slot map and PCM residency directly. It was deleted once ADR-112's `engine_pcm.rs` became the
+one PCM representation and a crate-wide check (all feature sets + the wasm32 target) confirmed
+zero consumers. Nothing in the parts bin is load-bearing today.
+
 **Refactor:** `tempo.rs` → integer mBPM + the segment table (new `timeline.rs` replaces
 `beat_timeline.rs`'s float accumulators); `engine.rs` facade → split into
 `control_plane.rs` / `audio_core.rs` per §3.3.

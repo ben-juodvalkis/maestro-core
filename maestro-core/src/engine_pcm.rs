@@ -124,7 +124,9 @@ fn i16_to_f32(s: i16) -> f32 {
 
 /// Engine-resident PCM with a monotone load frontier (ADR-112 §5.3). Single
 /// writer (the control plane / FFI caller thread), single RT reader. Replaces
-/// the immutable `Vec<Vec<f32>>` interior of `PcmData` for track playback.
+/// the immutable `Vec<Vec<f32>>` PCM interior the pre-rebuild cache used for
+/// track playback (`pcm_cache.rs`, deleted once this became the one
+/// representation — it had no consumers left).
 pub struct EnginePcm {
     channels: Channels,
     /// Frames per channel — the exact allocation, fixed at construction.

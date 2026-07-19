@@ -45,9 +45,6 @@ pub mod sabotage;
 // suites and the maestro-validate device-capture analyzer (spec §6.4).
 pub mod validation;
 
-// PCM storage (validated lengths, Arc-shared with the audio core).
-pub mod pcm_cache;
-
 // Engine-resident PCM behind a monotone load frontier (ADR-112 §5.3) — the
 // one representation for bulk-loaded AND streaming track playback buffers.
 pub mod engine_pcm;
