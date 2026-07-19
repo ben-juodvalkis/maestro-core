@@ -1,4 +1,4 @@
-//! # wasm-bindgen surface — the six-function transport (spec §3.6, M4)
+//! # wasm-bindgen surface — the transport (spec §3.6, M4)
 //!
 //! The web transport is IDENTICAL in shape to the UniFFI one
 //! ([`super::uniffi_api`]): exactly the schema transport, nothing else.
@@ -10,8 +10,14 @@
 //! new WasmMaestroEngine(config_json)        // init
 //! dispatch(command_json) -> result_json     // control plane, ≤ 60 Hz
 //! snapshot_json() / drain_events_json()     // egress
-//! load_pcm(meta_json, left, right)          // the one bulk-data call
+//! load_pcm(meta_json, left, right)          // bulk-data lane
 //! render(frames) + left_ptr()/right_ptr()   // audio thread only
+//!
+//! // the same lane, chunked (ADR-112) — NOT a second kind of lane:
+//! begin_pcm_stream(meta_json)               // StreamLoadMeta; validates, installs
+//! append_pcm_chunk(slot, seq, left, right)  // -> AppendResult { frontier }
+//! finalize_pcm_stream(slot)                 // TrackLoaded fires here
+//! abort_pcm_stream(slot)
 //! ```
 //!
 //! ## Threading model (spec §3.8)

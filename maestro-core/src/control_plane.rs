@@ -8,6 +8,14 @@
 //! memory — and owns the §4.11 variation PCM cache (per-song budget, eviction
 //! of the least-recently-audible variation, async switch bookkeeping).
 //!
+//! Since ADR-112 it additionally owns the **streaming load lifecycle**: the
+//! per-slot `Streaming` state, the §5.5 begin-time validation order (every
+//! identity-shaped check runs BEFORE any byte moves), trim-on-the-fly across
+//! appends, and the finalize honesty check against `declared_total_samples`.
+//! It is the single writer of the `EnginePcm` load frontier; the audio thread
+//! is the single reader. Bulk `load_pcm` is a composition over that same core
+//! — see [`ControlPlane::load_pcm`].
+//!
 //! State egress is exactly one call: [`ControlPlane::snapshot`] reads the
 //! seqlock'd POD the audio thread publishes each block and converts it to the
 //! `maestro-api` schema. JS holds render-only mirrors (spec §3.5).
@@ -597,8 +605,17 @@ impl ControlPlane {
             .sum()
     }
 
-    /// The one bulk-data call (spec §3.6). Performs §3.4 length reconciliation
+    /// The bulk-data lane (spec §3.6). Performs §3.4 length reconciliation
     /// and loop-identity validation; on success installs the track at its slot.
+    ///
+    /// Since ADR-112 this is a COMPOSITION, not a separate path: a fresh
+    /// install on an empty slot is literally begin + one (uncapped) append +
+    /// finalize over the streaming internals, so there is one validation/trim
+    /// implementation and no second code path to drift. The wire contract is
+    /// unchanged. Occupied-slot paths (variation swap, §4.11 park) cannot pass
+    /// through a v1 begin — it requires an Empty slot — so they construct a
+    /// complete `EnginePcm` directly through the same shared trim helpers
+    /// (ADR-112 §14#1); T-STREAM pins the byte-exact equivalence.
     ///
     /// `left`/`right` are the decoded PCM channels at 48 kHz. The platform shim
     /// guarantees no resampling and no channel conversion happened (spec §3.4#3)

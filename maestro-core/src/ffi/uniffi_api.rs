@@ -1,4 +1,4 @@
-//! # UniFFI surface — the six-function transport (spec §3.6)
+//! # UniFFI surface — the transport (spec §3.6)
 //!
 //! The native bridge exports exactly the schema transport and nothing else:
 //!
@@ -6,8 +6,14 @@
 //! MaestroEngine::new(config_json)          // init
 //! dispatch(command_json) -> result_json    // control plane, ≤ 60 Hz
 //! snapshot_json() / drain_events_json()    // egress
-//! load_pcm(meta_json, left, right)         // the one bulk-data call
+//! load_pcm(meta_json, left, right)         // bulk-data lane
 //! core_pointer() -> u64                    // handed to the render callback
+//!
+//! // the same lane, chunked (ADR-112) — NOT a second kind of lane:
+//! begin_pcm_stream(meta_json)              // StreamLoadMeta; validates, installs
+//! append_pcm_chunk(slot, seq, left, right) // -> AppendResult { frontier }
+//! finalize_pcm_stream(slot)                // TrackLoaded fires here
+//! abort_pcm_stream(slot)
 //! ```
 //!
 //! plus the C ABI `maestro_render` (declared in `include/maestro_render.h`),

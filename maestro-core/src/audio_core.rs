@@ -21,6 +21,12 @@
 //!   is momentarily full, command draining pauses for the block (commands stay
 //!   queued) rather than ever dropping a buffer on the audio thread.
 //! - `snapshot` (seqlock): written once per block.
+//! - `EnginePcm::frontier` (atomic, ADR-112): Acquire-loaded once per block
+//!   for a streaming track. The §5.4 starvation predicate compares it against
+//!   the highest PCM index this block's reads would touch — which includes the
+//!   stretch read-ahead and anchor window, not just the playhead. Below the
+//!   frontier the samples are published; above it they are uninitialized and
+//!   structurally never read.
 //!
 //! ## Positions are computed, never advanced
 //!
@@ -29,6 +35,14 @@
 //! (spec §3.1). There is no per-track cursor anywhere in this file — the
 //! `drift-injection` sabotage modes reintroduce the historic defect classes
 //! on purpose so CI can prove T-INV detects them.
+//!
+//! ADR-112's starvation rides this law rather than bending it: a track whose
+//! frontier is short takes the existing INAUDIBLE path (DSP skipped, meters
+//! zeroed, `last_wrap_count` re-based) — so it goes silent at the correct
+//! derived position and rejoins mid-music on resume, exactly like mute. There
+//! is no cursor to stall, which is why the feature added no position state.
+//! `t_stream.rs` pins this: dictated positions under starvation are
+//! bit-identical to an always-loaded control run.
 
 #![allow(clippy::too_many_arguments)]
 

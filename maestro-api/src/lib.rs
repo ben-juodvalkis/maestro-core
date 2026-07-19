@@ -12,8 +12,11 @@
 //! ```text
 //! init(config) ; dispatch(command_json) -> result_json    // control plane, ≤ 60 Hz
 //! snapshot_json() -> String ; drain_events_json() -> String
-//! load_pcm(track, variation, bytes, meta) -> result       // the one bulk-data call
+//! load_pcm(track, variation, bytes, meta) -> result       // bulk-data lane
 //! maestro_render(core, buffers, frames)                   // C ABI, audio thread only
+//!
+//! // the same lane, chunked (ADR-112): StreamLoadMeta in, AppendResult out
+//! begin_pcm_stream / append_pcm_chunk / finalize_pcm_stream / abort_pcm_stream
 //! ```
 //!
 //! **M2 scope:** the full control plane (spec §5 M2) — volume/pan/mute/solo,
@@ -298,7 +301,9 @@ pub enum AppendResult {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 pub enum Event {
     /// `reconciliation` names which §3.4 case fired ("alreadyTrimmed" /
-    /// "trimmedHere"); asserted stable across variations of a stem.
+    /// "trimmedHere" / "trimmedPadding"); asserted stable across variations
+    /// of a stem. On the ADR-112 streaming path this fires at FINALIZE, so
+    /// `trackLoaded` keeps meaning "the PCM is complete".
     TrackLoaded { slot: u8, variation: u8, reconciliation: String },
     TrackLoadFailed { slot: u8, reason: String },
     TrackRemoved { slot: u8 },

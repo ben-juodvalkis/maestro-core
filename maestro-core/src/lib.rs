@@ -5,7 +5,7 @@
 //!
 //! The native-rebuild architecture (documentation/specs/native-audio-rebuild.md):
 //! `timeline` (derived integer positions) + `audio_core` (audio thread) +
-//! `control_plane` (validation/prep) behind the six-function transports
+//! `control_plane` (validation/prep) behind the transports
 //! (`ffi::uniffi_api` native, `ffi::wasm_bindings` web).
 
 // Native rebuild (documentation/specs/native-audio-rebuild.md):
@@ -60,7 +60,7 @@ pub mod engine_pcm;
 pub mod stretch;
 
 // Step 9: Foreign Function Interface — wasm-bindgen exports (web) and the
-// UniFFI six-function transport (native, spec §3.6)
+// UniFFI transport (native, spec §3.6)
 pub mod ffi;
 
 // UniFFI scaffolding must be defined at the crate root.

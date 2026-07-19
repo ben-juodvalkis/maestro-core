@@ -286,6 +286,11 @@ Design decisions, each closing a §2 defect:
   tempo moves off unity, the track anchors a stretcher (below) and crossfades bypass→stretch
   over one block (equal-power, ≤ 10 ms); positions are unaffected (they are derived).
   Hysteresis: unity means `O_i == E` exactly (integer compare).
+  *Amended (ADR-112):* precisely, bypass output is bit-exact w.r.t. the **stored** samples.
+  For the default `SampleFormat::F32` that is the decoded PCM verbatim, exactly as before —
+  this repo's stems and every existing digest are untouched. An opt-in `I16` load quantizes
+  **once, at load** (a −96 dBFS noise floor added before the engine ever renders), and the
+  guarantee then reads against those stored samples. Positions are storage-blind either way.
 - **Anchoring (start, variation switch, unity transition, stretch-path tempo change,
   post-`ResetTimeline`).** One-time procedure: `reset()`; build a seek window of
   `input_latency + output_latency` source frames ending at the compensated feed origin
@@ -399,15 +404,34 @@ exactly consistent with the stem's musical identity, or the load fails loudly.**
    48 kHz context. Tests/CLI: `symphonia`.
 4. **Length reconciliation (in Rust, decoder-agnostic — the double-trim killer).** Given
    decoded length `L_dec`:
-   - `L_dec == original_samples` → decoder already applied gapless trim; **do not trim**.
-   - `L_dec == original_samples + encoder_delay + end_padding` → raw decode; trim exactly.
+   - `L_dec == original_samples` → decoder already applied gapless trim; **do not trim**
+     (`AlreadyTrimmed`).
+   - `L_dec == original_samples + encoder_delay + end_padding` → raw decode; trim exactly
+     (`TrimmedHere`).
+   - `L_dec == original_samples + end_padding` → the decoder applied the priming but **not**
+     the trailing padding; truncate exactly the padding (`TrimmedPadding`).
+     *Amended (ADR-095):* this third case is **Chrome's `decodeAudioData` behavior**, found
+     by this gate firing on the first M4 in-app WASM run. It is an exact integer equality
+     like the other two — not a heuristic, and not a relaxation of the invariant.
    - anything else → `TrackLoadFailed { reason: LengthMismatch {…} }`. No heuristics.
    The reconciliation result (which case fired, per file) is reported in the load event and
-   asserted stable across variations of a stem.
+   asserted stable across variations of a stem: same decoder + same encoder must reconcile
+   the same way, so a flip means a mis-tagged or mis-decoded file — a hard failure, not a
+   curiosity.
 5. **Seam validation (build time).** The pipeline's existing decode step additionally checks
    seam continuity per variation: `|pcm[0] − pcm[L−1]|` and short-window cross-correlation
    end→start within thresholds; failures are fixed at authoring/encode time (e.g. trim-to-
    zero-crossing or authored crossfade), **never at runtime**.
+6. **Streaming ingress (*amended ADR-112*).** The chunked path (§3.6) reaches the same
+   invariant from the other end: everything identity-shaped — #3's sample rate, the
+   reconciliation case (pre-declared via `StreamLoadMeta.declared_total_samples`), the #2
+   loop-identity gate, and the §4.8 rate clamp — validates **at begin, before any byte
+   moves**, so a host with bad metadata still fails in one round-trip and just as loudly.
+   Trimming then happens on the fly (incoming stream offsets map statically to buffer
+   offsets, samples outside the keep-window are counted and discarded), and `finalize`
+   verifies the host delivered exactly `declared_total_samples`. That honesty check is the
+   streaming analogue of the bulk length equality: under-delivery removes the track rather
+   than leaving a slot audibly playing data the host has failed to attest.
 
 ### 3.5 State authority and egress
 
@@ -422,15 +446,32 @@ struct Snapshot {                      // POD, seqlock'd, serde+ts-rs generated
   engine_frame: u64, tempo_mbpm: u32, transport: TransportState,
   bar: u32, beat_in_bar: f32,          // derived from bu(F); display only
   timeline_epoch: u32,
-  tracks: [TrackSnap; MAX_TRACKS],     // MAX_TRACKS = 16
+  // render-budget telemetry (§3.3) — the audio thread times itself (ADR-096)
+  underruns: u32, render_ns_max: u64, callback_period_ns: u64,
+  blocks_total: u64, blocks_over_half_period: u64,
+  events_dropped: u32,
+  pcm_bytes_in_use: u64,               // §4.11 budget reporting
+  tracks: Vec<TrackSnap>,              // slots 0..MAX_TRACKS (= 16)
 }
 struct TrackSnap {
   slot: u8,                            // stable slot index assigned by InstallTrack
-  status: TrackStatus, armed: bool, variation: u8,
+  status: TrackStatus, variation: u8,
+  gain: f32, pan: f32, muted: bool, solo: bool,
+  loop_beats: u32,                     // per-variation since ADR-109; flips with `variation`
   loop_count: u32, loop_progress: f32, // derived from bu(F) mod Λ; display only
   rms_l: f32, rms_r: f32, peak_l: f32, peak_r: f32,
+  // streaming load state (ADR-112) — == pcm_len / false / false for bulk loads
+  loaded_samples: u64,                 // the load frontier
+  streaming: bool,                     // true from begin until finalize/abort
+  starved: bool,                       // true while the render is silent at the frontier
 }
 ```
+
+*Amended (ADR-097):* `armed` is gone from `TrackSnap` — the arm/play duality was deleted in
+favour of a single `playing` state, and no field replaced it.
+
+*Amended (ADR-112):* `starved` is computed by the audio thread from the same predicate that
+gated rendering, in the same block, so the flag can never disagree with what was audible.
 
 Track identity across the bridge is the **slot index** (assigned at `InstallTrack`, freed at
 `RemoveTrack`, never reused while occupied); the backend owns the `trackId ↔ slot` map. No
@@ -439,6 +480,14 @@ string hashing in the snapshot — no collision class, no per-poll string traffi
 - `drain_events() → Vec<Event>` — edge-triggered only (loaded, failed, started, stopped,
   underrun, tempo-applied, variation-applied). No state is reconstructed from events; missing
   an event can never desync JS because JS state is cosmetic.
+  *Amended (ADR-112):* `streamStarved { slot, at_frame, needed, frontier }` and
+  `streamResumed { slot, at_frame }` report a streaming track crossing into and out of
+  silence at the load frontier. They are deliberately **not** `underrun`, which already
+  means something else here (a block whose render time exceeded the callback period). Both
+  stay cosmetic under the rule above: starvation costs audibility, never position, so a host
+  that drops them is left with silence it cannot explain — never a desync.
+  `trackLoaded` keeps its contract that the PCM is complete: on the streaming path it fires
+  at **finalize**, not at begin.
 - **JS makes no timing decisions.** `toggleTrack` etc. send commands; the engine decides
   activation frames (quantize policy is a command parameter). The branch's Bug 1/2 class
   (bridge round-trip in the timing path) is structurally gone — there is no beat capture to
@@ -456,14 +505,35 @@ Transport surface (total, for every platform):
 ```
 init(config) ; dispatch(command_json: String) -> result_json   // control plane, ≤ 60 Hz
 snapshot_json() -> String ; drain_events_json() -> String      // egress
-load_pcm(track, variation, bytes/ptr, meta) -> result          // the one bulk-data call
+load_pcm(track, variation, bytes/ptr, meta) -> result          // bulk-data lane
 maestro_render(core, buffers, frames)                          // C ABI, audio thread only
 ```
 
-- **Native:** UniFFI proc-macros export exactly these six (no UDL, no mirror types — the
+*Amended (ADR-112):* the bulk-data lane **widens** rather than gaining a second kind of
+lane — four additive functions carry the same PCM in chunks, so streaming payloads never
+get smuggled through `dispatch` (which stays JSON-only):
+
+```
+begin_pcm_stream(meta_json: &str) -> result          // StreamLoadMeta; validates, installs at frontier 0
+append_pcm_chunk(slot, seq, left, right)
+       -> AppendResult { frontier, complete } | Rejected    // ≤ MAX_STREAM_APPEND_FRAMES (480_000)
+finalize_pcm_stream(slot) -> result                  // verifies totals; TrackLoaded fires HERE
+abort_pcm_stream(slot) -> result                     // teardown; buffers reclaimed off-RT
+```
+
+`load_pcm` keeps its wire contract verbatim and remains the recommended path for small
+assets; internally a fresh install is now literally `begin + one (uncapped) append +
+finalize` over the same core, so there is one validation/trim implementation and no second
+code path to drift (ADR-112 §5.3, §14#1). The ack-carried `frontier` — not the snapshot —
+is the host's backpressure and head-start signal, because the SAB snapshot only refreshes
+while the graph renders. Usage guide: `documentation/engine/streaming-pcm-load.md`.
+
+- **Native:** UniFFI proc-macros export exactly these ten (no UDL, no mirror types — the
   1,216-line `uniffi_api.rs` and 1,168-line `wasm_bindings.rs` mirrors are not ported).
   Swift plugin = passthrough + decode/load + AVAudioEngine setup; it holds no state.
-- **WASM:** the same six via `wasm-bindgen`. Same JSON in both transports; the TS layer has
+  The streaming four sit behind the same control-plane `Mutex`; the audio thread never
+  touches it.
+- **WASM:** the same ten via `wasm-bindgen`. Same JSON in both transports; the TS layer has
   **one** codec, generated. Events arrive correctly shaped — `NativeEventBridge` is replaced
   by `JSON.parse` + a generated type guard.
 - Adding an operation = one enum variant + one `match` arm in ControlPlane. CI's
@@ -544,7 +614,7 @@ Level meters read from the snapshot poll (no separate polling path).
 | 4.8 | Tempo/pitch ranges | Engine tempo clamp 40–300 BPM; rate `E/O_i` clamped to [0.25, 4.0]; pitch ±12 semitones. Combined time-pitch ratio kept inside Signalsmith's clean-stretch bound to avoid its RNG path (audio-value nondeterminism, §2.3#4). Out-of-range commands are rejected with an error event. |
 | 4.9 | Interruptions / routes | Interruption → `Pause` command (F freezes; all tracks together; resume continues — positions derived, nothing to re-anchor). Route change → AVAudioEngine restart, F continuity preserved; media-services-reset → rebuild graph, engine state survives in-process. All handled in Swift→command, never in JS. |
 | 4.10 | Capacitor bridge latency | Accepted for control feel (commands apply at the next block boundary, ≤ ~30 ms end-to-end). Quantized starts make this musically irrelevant; nothing timing-critical crosses the bridge (§3.5). |
-| 4.11 | PCM memory policy | Worst-case naive load is real (~17 MB per variation per long stem; 5 stems × 3 variations ≈ 250 MB — jetsam territory). Policy: **eager-load the default variation only**; simple/complex load lazily on first variation interaction (prefetch on UI hover/long-press), Arc-swapped per §3.2 with eviction of the variation least recently audible once a **per-song PCM budget of 96 MB** is exceeded (never evicting an audible variation). Variation switch to a not-yet-loaded variation is asynchronous: command is acknowledged, swap applies on load completion at a block boundary (event signals it). Memory in use is reported in the snapshot; C2 and C5 gate on the budget. f32 storage stands; int16 storage (−50%) is the pre-decided contingency if the budget fails on the largest song. **Amended (ADR-098)**: the budget is `EngineConfig.pcm_budget_bytes` (omitted → the 96 MB default above); the composition roots pass a device-RAM-tiered value (288 MiB ≥ 6 GiB RAM / web desktop, 192 MiB ≥ 4 GiB, default otherwise — `pcm-budget-policy.ts`). On prewarm-enabled tiers, song load additionally fetches+decodes every non-default variation in the background and parks it via `LoadMeta.cache_only` loads (park in the slot's cache, NO swap, RT untouched; a park while a switch to that variation is pending completes the switch; a cache-only load of the installed variation is a no-op; empty slot rejected), so variation switches take the cached path (<10 ms) instead of the async round-trip. Default-tier devices keep the lazy behavior above verbatim. **Amended (ADR-101)**: a compressed stem cache (T2, `maestro-stems-v1` Cache Storage on web) sits ABOVE the backend transports — the one per-platform fetch site reads through and writes back to it, and a background prefill downloads all variations at song load on EVERY tier (gated by Save-Data/quota). The engine never learns it exists; the async-switch round-trip above becomes disk-read + decode once T2 is warm. Decoded-PCM residency (this section's budget) remains the only engine-side cache. **Amended (ADR-103)**: ADR-098's prewarm boolean is retired — decoded residency is a budget-aware gradient on every tier: a pure PARKING PLANNER (backend-side, `parking-planner.ts`) parks candidates round-robin across stems while projected resident PCM ≤ configured budget − installed − 10% headroom (never relying on this section's LRU eviction to correct it — eviction stays the safety net); an intent MICRO-WARM parks a stem's remaining variations on the ADR-097 controls-visible toggle and on every variation gesture, displacing the plan's coldest entries via the existing eviction. The engine surface is unchanged. **Amended (ADR-104)**: additive `Command::TrimPcmCache { target_bytes }` — a one-shot memory-pressure trim: evict PARKED entries least-recently-audible-first down to the target (this section's eviction loop with an explicit limit); installed PCM and the RT thread untouched; the configured budget unchanged (later switches re-park lazily from the compressed cache). Dispatched Swift-side from a `DispatchSource` memory-pressure handler (`.warning` → budget/2, `.critical` → 0 — §4.9-style Swift→command policy). A new Command variant per the §3.6 schema-evolution law: old engines reject it loudly. |
+| 4.11 | PCM memory policy | Worst-case naive load is real (~17 MB per variation per long stem; 5 stems × 3 variations ≈ 250 MB — jetsam territory). Policy: **eager-load the default variation only**; simple/complex load lazily on first variation interaction (prefetch on UI hover/long-press), Arc-swapped per §3.2 with eviction of the variation least recently audible once a **per-song PCM budget of 96 MB** is exceeded (never evicting an audible variation). Variation switch to a not-yet-loaded variation is asynchronous: command is acknowledged, swap applies on load completion at a block boundary (event signals it). Memory in use is reported in the snapshot; C2 and C5 gate on the budget. f32 storage stands; int16 storage (−50%) is the pre-decided contingency if the budget fails on the largest song. **Amended (ADR-098)**: the budget is `EngineConfig.pcm_budget_bytes` (omitted → the 96 MB default above); the composition roots pass a device-RAM-tiered value (288 MiB ≥ 6 GiB RAM / web desktop, 192 MiB ≥ 4 GiB, default otherwise — `pcm-budget-policy.ts`). On prewarm-enabled tiers, song load additionally fetches+decodes every non-default variation in the background and parks it via `LoadMeta.cache_only` loads (park in the slot's cache, NO swap, RT untouched; a park while a switch to that variation is pending completes the switch; a cache-only load of the installed variation is a no-op; empty slot rejected), so variation switches take the cached path (<10 ms) instead of the async round-trip. Default-tier devices keep the lazy behavior above verbatim. **Amended (ADR-101)**: a compressed stem cache (T2, `maestro-stems-v1` Cache Storage on web) sits ABOVE the backend transports — the one per-platform fetch site reads through and writes back to it, and a background prefill downloads all variations at song load on EVERY tier (gated by Save-Data/quota). The engine never learns it exists; the async-switch round-trip above becomes disk-read + decode once T2 is warm. Decoded-PCM residency (this section's budget) remains the only engine-side cache. **Amended (ADR-103)**: ADR-098's prewarm boolean is retired — decoded residency is a budget-aware gradient on every tier: a pure PARKING PLANNER (backend-side, `parking-planner.ts`) parks candidates round-robin across stems while projected resident PCM ≤ configured budget − installed − 10% headroom (never relying on this section's LRU eviction to correct it — eviction stays the safety net); an intent MICRO-WARM parks a stem's remaining variations on the ADR-097 controls-visible toggle and on every variation gesture, displacing the plan's coldest entries via the existing eviction. The engine surface is unchanged. **Amended (ADR-104)**: additive `Command::TrimPcmCache { target_bytes }` — a one-shot memory-pressure trim: evict PARKED entries least-recently-audible-first down to the target (this section's eviction loop with an explicit limit); installed PCM and the RT thread untouched; the configured budget unchanged (later switches re-park lazily from the compressed cache). Dispatched Swift-side from a `DispatchSource` memory-pressure handler (`.warning` → budget/2, `.critical` → 0 — §4.9-style Swift→command policy). A new Command variant per the §3.6 schema-evolution law: old engines reject it loudly. **Amended (ADR-112)**: the int16 contingency above is no longer hypothetical — it **shipped**, as `StreamLoadMeta.sample_format = SampleFormat::I16`, opt-in **per load**. Storage halves (−50% as predicted); the default stays `F32`, so this repo's stems and their digests are unchanged, and the choice is the host's per load rather than a global mode. Conversion rides `read_pcm`'s existing per-block copy, and position math is storage-blind, so nothing in §3.1 moves. Quality is bounded, not free: the unity-path null measures −103.9 dBFS, but a phase vocoder does not preserve small input deltas, so through the **stretch** path the load-quantization floor emerges rate-dependently — measured worst **−51.3 dBFS at 1.5×** (−97.4 at 0.75×, −65.4 at 1.1×, −66.5 at 2×), which the null test pins at ≤ −45 dBFS. i16 is therefore a residency tool for large host-attested material, not a default. Residency is bounded per-load in one more way (ADR-112 §5.3): `pcm_bytes_in_use` counts **allocated capacity, not the frontier**, so a streaming track costs its full size from `begin` and this section's eviction math can never under-count a partially-loaded stream. |
 | 4.12 | Library lint (build-time) | The pipeline validates every song before publish: stem count ≤ MAX_TRACKS (16); `loop_beats`, `original_tempo_mbpm`, per-file gapless metadata present; PER-FILE loop-identity check (§3.4#2, amended ADR-109); the ADR-109 whole-bar rule (when a stem's variation lengths differ, each variation's `loop_beats` must divide evenly by the time-signature numerator); seam check (§3.4#5); `beats_per_bar` taken from the song's time-signature metadata (no hardcoded 4/4 in the engine — bar display derives from it). A song failing lint cannot ship; the engine still re-validates at load (defense in depth — except the whole-bar rule, which is lint-only: the engine stays bar-agnostic). |
 | 4.13 | Lock screen / remote controls, background-audio UX | Out of scope for this program (product feature, not engine). The session category (`.playback`) already permits background playback; MPRemoteCommandCenter wiring is backlog. Noted so its absence is a decision, not an oversight. |
 
@@ -748,10 +818,42 @@ commands/s for 10 M frames; assert T-INV invariants still hold at every checkpoi
 RT queues never overflow silently (overflow = surfaced event + test failure), and snapshot
 fields stay consistent (e.g. `loop_progress` monotone within a wrap).
 
-### 6.8 CI policy
+### 6.8 T-STREAM: chunked/streaming load (offline, every commit) — *added ADR-112*
 
-- Every commit: T-INV, T-SEAM, T-LOAD, T-CTRL + negative controls (cargo, both feature
-  sets); ts-rs binding drift check; clippy RT lints; `assert_no_alloc` render test.
+`tests/t_stream.rs` (22 tests). The suite's spine is **equivalence, not new behavior**:
+because bulk `load_pcm` is re-expressed internally as begin+append+finalize (§3.6), the
+first three tests assert a streamed load is byte-identical to the bulk load of the same
+asset in each of the three §3.4#4 reconciliation cases — that is what licenses the
+unification. On top of that:
+
+- **Lifecycle/rejection legs** — begin's validation set (occupied slot, `cache_only`,
+  sample rate, loop identity, rate clamp, i16); out-of-order `seq` tears the stream down;
+  over-delivery and post-finalize appends reject *without* disturbing an intact stream
+  (they are recoverable, so they surface only as `AppendResult::Rejected` — never as
+  `trackLoadFailed`, per ADR-112 §14#2); oversize append; finalize under-delivery removes
+  the track; abort empties the slot; `SwitchVariation` / `load_pcm` reject on a streaming slot.
+- **Starvation predicate at the exact boundary** — starves at `frontier − 1` and renders at
+  `frontier`; the stretch path at the 4× clamp demands the ADR-094 compensated lead (the
+  predicate covers read-ahead, not just the playhead); the wrap seam starves an incomplete
+  stream and resumes after the wrap (§5.8); the resume margin prevents flutter at a
+  consumption-rate feed.
+- **The zero-drift claim under starvation** — dictated positions are bit-identical to an
+  always-loaded control run. This is the load-bearing one: it proves starvation costs
+  audibility and nothing else, which is what lets §3.1 stay untouched by this whole feature.
+- **Snapshot truthfulness** — `loaded_samples`/`streaming`/`starved` reported honestly,
+  including finalize-while-starved clearing the flag and firing `streamResumed`.
+- **i16 (§4.11)** — unity and stretch null tests (bounds in §4.11), budget accounting halves.
+- **Composition** — pause/tempo/appends interleaved mid-stream.
+
+ADR-113's `Command::SetTimelineOrigin` ships its own suite, `tests/timeline_origin.rs`:
+exact derived positions against the bigint reference, byte-exact mid-song entry vs a
+from-zero control, wrap re-basing at a near-tail origin, the rejected-while-playing guard,
+and zero-origin identity.
+
+### 6.9 CI policy
+
+- Every commit: T-INV, T-SEAM, T-LOAD, T-CTRL, T-STREAM + negative controls (cargo, both
+  feature sets); ts-rs binding drift check; clippy RT lints; `assert_no_alloc` render test.
 - Every milestone touching render/delivery + every release: T-DEV on physical hardware;
   the report is part of the PR.
 - A milestone PR that changes any threshold or disables any negative control does not merge
