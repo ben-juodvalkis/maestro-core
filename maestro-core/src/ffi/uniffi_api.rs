@@ -99,6 +99,11 @@ fn rejected(reason: String) -> String {
 #[uniffi::export]
 impl MaestroEngine {
     /// `init` (spec §3.6): `config_json` is a `maestro-api` `EngineConfig`.
+    ///
+    /// Constructs the two control-plane locks; same FFI-boundary exception to
+    /// the no-locks rule as their field declarations (rationale at the top of
+    /// this file, policy in clippy.toml). Nothing here is on the audio path.
+    #[allow(clippy::disallowed_types)]
     #[uniffi::constructor]
     pub fn new(config_json: String) -> Result<Arc<Self>, MaestroFfiError> {
         let config: maestro_api::EngineConfig = serde_json::from_str(&config_json)
