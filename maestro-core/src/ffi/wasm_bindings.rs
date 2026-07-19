@@ -129,6 +129,48 @@ impl WasmMaestroEngine {
         }
     }
 
+    // -------------------------------------------------- streaming load (ADR-112)
+
+    /// `begin_pcm_stream` (ADR-112 §5.2): `meta_json` is a `maestro-api`
+    /// `StreamLoadMeta`. Validates everything identity-shaped before any
+    /// byte moves; on success the track is installed at frontier 0.
+    pub fn begin_pcm_stream(&mut self, meta_json: &str) -> String {
+        let smeta: maestro_api::StreamLoadMeta = match serde_json::from_str(meta_json) {
+            Ok(m) => m,
+            Err(e) => return rejected(format!("malformed stream meta: {e}")),
+        };
+        match self.control.begin_pcm_stream(&smeta) {
+            Ok(()) => json_result(maestro_api::CommandResult::Ok),
+            Err(reason) => rejected(reason),
+        }
+    }
+
+    /// `append_pcm_chunk` (ADR-112 §5.2): returns an `AppendResult` JSON
+    /// whose `frontier` is the host's backpressure/head-start signal. Capped
+    /// engine-side at `MAX_STREAM_APPEND_FRAMES` per append.
+    pub fn append_pcm_chunk(&mut self, slot: u8, seq: u32, left: Vec<f32>, right: Vec<f32>) -> String {
+        serde_json::to_string(&self.control.append_pcm_chunk(slot, seq, &left, &right))
+            .expect("AppendResult serializes")
+    }
+
+    /// `finalize_pcm_stream` (ADR-112 §5.5): verifies delivered totals and
+    /// completes the track (`Event::TrackLoaded` fires here).
+    pub fn finalize_pcm_stream(&mut self, slot: u8) -> String {
+        match self.control.finalize_pcm_stream(slot) {
+            Ok(_) => json_result(maestro_api::CommandResult::Ok),
+            Err(reason) => rejected(reason),
+        }
+    }
+
+    /// `abort_pcm_stream` (ADR-112 §5.5): tears the stream down; buffers are
+    /// reclaimed off the audio thread.
+    pub fn abort_pcm_stream(&mut self, slot: u8) -> String {
+        match self.control.abort_pcm_stream(slot) {
+            Ok(()) => json_result(maestro_api::CommandResult::Ok),
+            Err(reason) => rejected(reason),
+        }
+    }
+
     // ------------------------------------------------------------ audio thread
 
     /// Render one block into the engine-owned output buffers. Called from

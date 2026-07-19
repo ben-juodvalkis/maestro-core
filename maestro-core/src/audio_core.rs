@@ -38,7 +38,7 @@ use std::time::Instant;
 
 use maestro_api::QuantizePolicy;
 
-use crate::pcm_cache::PcmData;
+use crate::engine_pcm::EnginePcm;
 use crate::seqlock::SeqLock;
 use crate::stretch::Stretcher;
 use crate::timeline::{beats_display, Timeline, TrackTimeline, BEAT_UNITS_PER_BEAT};
@@ -54,6 +54,12 @@ const MAX_FEED_FRAMES: usize = MAX_BLOCK_FRAMES * MAX_RATE + 2;
 /// Activation gain ramp (spec §3.2): ≤ 10 ms; masks the anchor's one-block
 /// smear and avoids clicks when a track joins mid-waveform.
 pub const ACTIVATION_RAMP_FRAMES: u32 = 480;
+/// ADR-112 §5.4 resume hysteresis: a starved track re-enters only once the
+/// frontier passes the failed requirement by this margin (1 s of source ≈
+/// 250 ms of output at the 4× rate clamp). Without it, a frontier advancing
+/// at exactly playback speed flutters audibly. Engine-owned, not
+/// configurable in v1.
+pub const STREAM_RESUME_MARGIN_FRAMES: u64 = 48_000;
 
 /// Commands crossing control plane → audio core. Applied at block boundaries.
 pub enum RtCommand {
@@ -100,7 +106,11 @@ pub enum RtCommand {
     /// incoming variation's timing map so a length change installs atomically
     /// with the PCM — loop length and read length can never be two
     /// hand-synchronized values (the D9 guard, spec §2.3).
-    SwapVariation { slot: u8, variation: u8, pcm: Arc<PcmData>, map: TrackTimeline },
+    SwapVariation { slot: u8, variation: u8, pcm: Arc<EnginePcm>, map: TrackTimeline },
+    /// ADR-113: epoch re-base with a nonzero musical origin. Applied only
+    /// while the transport is stopped (validated control-side; ignored here
+    /// if racing a start — the host owns transport sequencing).
+    SetTimelineOrigin { bu: u64 },
 }
 
 /// Edge events audio core → control plane. `Copy` so dropping on overflow
@@ -128,6 +138,11 @@ pub enum RtEvent {
     /// (ADR-109), so the count is comparable only within one variation's
     /// tenure.
     LoopWrapped { slot: u8, wrap_count: u32 },
+    /// ADR-112 §5.4: a streaming track's render was starved at the load
+    /// frontier — it takes the inaudible path (silence) from `at_frame`.
+    StreamStarved { slot: u8, at_frame: u64, needed: u64, frontier: u64 },
+    /// The starved track re-entered (re-anchor + activation ramp).
+    StreamResumed { slot: u8, at_frame: u64 },
     BudgetExceeded { render_ns: u64, period_ns: u64 },
 }
 
@@ -195,7 +210,7 @@ fn mix_coefficients(gain: f32, pan: f32) -> (f32, f32) {
 pub enum Reclaimable {
     Track(Box<TrackState>),
     /// A variation's outgoing PCM after its crossfade block (spec §3.2).
-    Pcm(Arc<PcmData>),
+    Pcm(Arc<EnginePcm>),
 }
 
 /// POD per-track snapshot slice (display only).
@@ -217,6 +232,12 @@ pub struct RawTrackSnap {
     pub rms_r: f32,
     pub peak_l: f32,
     pub peak_r: f32,
+    /// Load frontier in samples (ADR-112); == pcm_len once complete.
+    pub loaded_samples: u64,
+    /// True from begin until finalize/abort.
+    pub streaming: bool,
+    /// True while the render is starved at the frontier (silent).
+    pub starved: bool,
 }
 
 /// POD snapshot written by the audio thread once per block (spec §3.5).
@@ -270,7 +291,7 @@ impl RawSnapshot {
 /// SPSC command queue. Holds **no positional state** — see module docs.
 pub struct TrackState {
     map: TrackTimeline,
-    pcm: Arc<PcmData>,
+    pcm: Arc<EnginePcm>,
     active: bool,
     /// Target gain/pan (control-plane validated). The render loop ramps the
     /// applied mix coefficients toward these over one block — audio-only.
@@ -312,12 +333,19 @@ pub struct TrackState {
     /// different loop lengths (ADR-109) — the fade-out read must wrap at the
     /// OUTGOING variation's Λ and bound by ITS pcm_len. `TrackTimeline` is
     /// `Copy` with no heap, so dropping it here is RT-safe.
-    xfade_old: Option<(Arc<PcmData>, TrackTimeline)>,
+    xfade_old: Option<(Arc<EnginePcm>, TrackTimeline)>,
     /// A retired PCM waiting for reclaim-queue space (overflow fallback).
-    retired_pcm: Option<Arc<PcmData>>,
+    retired_pcm: Option<Arc<EnginePcm>>,
     /// Always provided (M1 tempo changes can move any track off unity).
     /// Preallocated by the control plane; `anchor` and `process` never allocate.
     stretcher: Box<Stretcher>,
+    /// Cached completeness of `pcm` (ADR-112): refreshed with an Acquire
+    /// load only while false, so complete/bulk tracks pay one branch per
+    /// block and never touch the atomics again.
+    pcm_complete: bool,
+    /// True while the render is starved at the load frontier (ADR-112 §5.4).
+    /// Edge in/out fires StreamStarved/StreamResumed.
+    starved: bool,
     needs_anchor: bool,
     /// Set with `needs_anchor` by a tempo change that re-anchors a warm
     /// mid-stream stretch track (ADR-094): the OLD tempo, letting the next
@@ -351,17 +379,21 @@ impl TrackState {
     /// length `map.pcm_len()` (validated in the control plane).
     pub fn new(
         map: TrackTimeline,
-        pcm: Arc<PcmData>,
+        pcm: Arc<EnginePcm>,
         gain: f32,
         pan: f32,
         variation: u8,
         mut stretcher: Box<Stretcher>,
     ) -> Self {
+        debug_assert_eq!(pcm.len(), map.pcm_len());
         let anchor_frames = stretcher.input_latency() + stretcher.output_latency();
         stretcher.preallocate(MAX_FEED_FRAMES.max(anchor_frames), MAX_BLOCK_FRAMES);
+        let pcm_complete = pcm.is_complete();
         Self {
             map,
             pcm,
+            pcm_complete,
+            starved: false,
             active: false,
             gain,
             pan,
@@ -642,9 +674,72 @@ impl AudioCore {
                         ts.applied_mix = None;
                         ts.last_wrap_count = ts.map.wrap_count(bu0);
                     }
-                    ts.was_audible = audible_target;
                     let bu_start =
                         if offset == 0 { bu0 } else { self.timeline.bu(f0 + offset as u64) };
+                    // §5.4 starvation gate (ADR-112): an incomplete track
+                    // whose reads this block would touch at/above the load
+                    // frontier takes exactly the inaudible path instead —
+                    // DSP skipped, meters zeroed, wrap bookkeeping re-based,
+                    // positions untouched (the clock does not care). Placed
+                    // AFTER the re-entry mutations above so the predicate
+                    // sees exactly the state render_track will see.
+                    if !ts.pcm_complete {
+                        if ts.pcm.is_complete() {
+                            ts.pcm_complete = true;
+                        } else if let Some(touched) =
+                            required_max_touched(ts, bu_start, bu1, tempo, b - offset)
+                        {
+                            let needed = touched + 1;
+                            let frontier = ts.pcm.frontier();
+                            // Hysteresis (§5.4): re-entry needs the resume
+                            // margin past the requirement that failed.
+                            let resume_at = needed
+                                .saturating_add(STREAM_RESUME_MARGIN_FRAMES)
+                                .min(ts.map.pcm_len());
+                            let can_render =
+                                frontier >= if ts.starved { resume_at } else { needed };
+                            if !can_render {
+                                if !ts.starved {
+                                    ts.starved = true;
+                                    push_event(
+                                        &mut self.events,
+                                        &mut self.events_dropped,
+                                        RtEvent::StreamStarved {
+                                            slot: slot as u8,
+                                            at_frame: f0 + offset as u64,
+                                            needed,
+                                            frontier,
+                                        },
+                                    );
+                                }
+                                ts.was_audible = false;
+                                ts.applied_mix = None;
+                                ts.meter = TrackMeter::default();
+                                ts.last_wrap_count = ts.map.wrap_count(bu1);
+                                continue;
+                            }
+                        }
+                        // Reaching here means this block renders: the demand
+                        // cleared the resume margin, the stream just completed
+                        // (everything readable — no margin applies), or the
+                        // block touches nothing. A set flag is therefore the
+                        // resume edge — clearing it ONLY on the margin path
+                        // left a track that finalized while starved reporting
+                        // `starved: true` forever (the completion branch above
+                        // stops this whole gate from running again).
+                        if ts.starved {
+                            ts.starved = false;
+                            push_event(
+                                &mut self.events,
+                                &mut self.events_dropped,
+                                RtEvent::StreamResumed {
+                                    slot: slot as u8,
+                                    at_frame: f0 + offset as u64,
+                                },
+                            );
+                        }
+                    }
+                    ts.was_audible = audible_target;
                     render_track(
                         ts,
                         bu_start,
@@ -916,6 +1011,38 @@ impl AudioCore {
                         ts.pitch_semitones = semitones;
                     }
                 }
+                RtCommand::SetTimelineOrigin { bu } => {
+                    // ADR-113: exactly the Stop epoch reset with a nonzero
+                    // start_bu. Positions derive from `bu` at the next Play;
+                    // per-track bookkeeping re-bases like do_stop's.
+                    // A racing Play that won the queue makes applying unsafe
+                    // (it would re-base a running clock) — dropping is the
+                    // only sound RT choice, but it means the host's earlier
+                    // Ok was optimistic. The host contract (one origin, then
+                    // one scheduled play, one in flight) makes this
+                    // unreachable; loud in debug if that ever breaks.
+                    debug_assert!(
+                        !self.playing,
+                        "SetTimelineOrigin raced a Play — host must sequence transport (ADR-113)"
+                    );
+                    if !self.playing {
+                        let tempo = self.timeline.tempo_mbpm_at(self.frame);
+                        let _ = self.timeline.reset_with_origin(self.frame, tempo, bu as u128);
+                        let bu0 = self.timeline.bu(self.frame);
+                        for ts in self.tracks.iter_mut().flatten() {
+                            ts.needs_anchor = true;
+                            ts.prev_unity = None;
+                            ts.last_wrap_count = ts.map.wrap_count(bu0);
+                            // The epoch reset invalidates any quantized
+                            // activation target (it was a bu of the old epoch).
+                            ts.pending_bu = None;
+                            #[cfg(feature = "drift-injection")]
+                            {
+                                ts.float_cursor = None;
+                            }
+                        }
+                    }
+                }
                 RtCommand::SwapVariation { slot, variation, pcm, map } => {
                     let frame = self.frame;
                     let bu = self.timeline.bu(frame);
@@ -923,6 +1050,11 @@ impl AudioCore {
                     if let Some(ts) = self.tracks.get_mut(slot as usize).and_then(Option::as_deref_mut) {
                         let old_pcm = std::mem::replace(&mut ts.pcm, pcm);
                         let old_map = std::mem::replace(&mut ts.map, map);
+                        // Swaps only install complete PCM (streaming slots
+                        // reject SwitchVariation, ADR-112 §5.5) — refresh the
+                        // cached completeness for the incoming buffer.
+                        ts.pcm_complete = ts.pcm.is_complete();
+                        ts.starved = false;
                         ts.variation = variation;
                         ts.needs_anchor = true;
                         // Λ may have changed (per-variation lengths, ADR-109):
@@ -1022,6 +1154,12 @@ impl AudioCore {
                     rms_r: ts.meter.rms_r,
                     peak_l: ts.meter.peak_l,
                     peak_r: ts.meter.peak_r,
+                    // Live atomics, not the render-path cache: a stream can
+                    // complete while paused/stopped and the snapshot must
+                    // say so (ADR-112 §5.1).
+                    loaded_samples: ts.pcm.frontier(),
+                    streaming: !ts.pcm.is_complete(),
+                    starved: ts.starved,
                 };
             }
         }
@@ -1092,10 +1230,8 @@ pub extern "C" fn maestro_set_sabotage(mode: u8) {
 /// function so the variation crossfade can read the *outgoing* PCM through
 /// the *outgoing* variation's map (per-variation lengths, ADR-109); `pcm`
 /// must be the PCM this `map` was validated against.
-fn read_pcm(map: &TrackTimeline, pcm: &PcmData, n: u64, frames: usize, dest: &mut [f32]) {
+fn read_pcm(map: &TrackTimeline, pcm: &EnginePcm, n: u64, frames: usize, dest: &mut [f32]) {
     debug_assert!(dest.len() >= frames * 2);
-    let l = &pcm.channel_data[0];
-    let r = &pcm.channel_data[1];
     let pcm_len = map.pcm_len();
 
     #[cfg(feature = "drift-injection")]
@@ -1103,8 +1239,7 @@ fn read_pcm(map: &TrackTimeline, pcm: &PcmData, n: u64, frames: usize, dest: &mu
         // Defect D2's audio half: modulo PCM length, ignoring beat space.
         for k in 0..frames {
             let idx = ((n + k as u64) % pcm_len) as usize;
-            dest[k * 2] = l[idx];
-            dest[k * 2 + 1] = r[idx];
+            pcm.copy_interleaved(idx, 1, &mut dest[k * 2..k * 2 + 2]);
         }
         return;
     }
@@ -1121,17 +1256,101 @@ fn read_pcm(map: &TrackTimeline, pcm: &PcmData, n: u64, frames: usize, dest: &mu
         let avail = pcm_len - idx;
         let copy = run.min(avail) as usize;
         let (idx, run) = (idx as usize, run as usize);
-        for k in 0..copy {
-            dest[(filled + k) * 2] = l[idx + k];
-            dest[(filled + k) * 2 + 1] = r[idx + k];
+        if copy > 0 {
+            pcm.copy_interleaved(idx, copy, &mut dest[filled * 2..(filled + copy) * 2]);
         }
-        for k in copy..run {
-            dest[(filled + k) * 2] = l[pcm_len as usize - 1];
-            dest[(filled + k) * 2 + 1] = r[pcm_len as usize - 1];
+        if copy < run {
+            pcm.fill_interleaved(
+                pcm_len as usize - 1,
+                run - copy,
+                &mut dest[(filled + copy) * 2..(filled + run) * 2],
+            );
         }
         filled += run;
         n += run as u64;
     }
+}
+
+/// The highest PCM index the span `[lo, hi)` touches, under the Bresenham
+/// wrap (ADR-112 §5.4): a span crossing a wrap seam reads the loop TAIL
+/// (`read_pcm`'s clamp arm reads `pcm_len − 1`); within one wrap the index
+/// is monotone, so the maximum is at `hi − 1`.
+fn max_touched(map: &TrackTimeline, lo: u64, hi: u64) -> u64 {
+    debug_assert!(hi > lo);
+    if map.wrap_of_sample(hi - 1) > map.wrap_of_sample(lo) {
+        map.pcm_len() - 1
+    } else {
+        map.pcm_index(hi - 1)
+    }
+}
+
+/// ADR-112 §5.4: the highest PCM index of every source read `render_track`
+/// would issue this block, or `None` when no read occurs. MIRRORS
+/// `render_track`'s branch structure — any read added there must be added
+/// here (the fade arms are over-approximated conservatively where the two
+/// diverge only in transition bookkeeping; a false starve is one silent
+/// block behind the resume margin, a false render would read uninitialized
+/// memory). The mirror claim covers PRODUCTION reads only: the test-only
+/// `drift-injection` sabotage paths (FloatCursor especially) deliberately
+/// diverge from dictated positions and are not modeled here.
+fn required_max_touched(
+    ts: &TrackState,
+    bu0: u128,
+    bu1: u128,
+    tempo_mbpm: u32,
+    b: usize,
+) -> Option<u64> {
+    let map = &ts.map;
+    let in_lat = ts.stretcher.input_latency() as u64;
+    let out_lat = ts.stretcher.output_latency() as u64;
+    let unity = map.original_tempo_mbpm() == tempo_mbpm && ts.pitch_semitones == 0.0;
+    let n0 = ts.dictated_u(bu0);
+    let lead = out_lat as u128 * tempo_mbpm as u128;
+    let n0_s = ts.dictated_u(bu0 + lead);
+    let span_s = ((ts.dictated_u(bu1 + lead) - n0_s) as usize).min(MAX_FEED_FRAMES) as u64;
+    let mut worst: Option<u64> = None;
+    let mut add = |lo: u64, hi: u64| {
+        if hi > lo {
+            let m = max_touched(map, lo, hi);
+            worst = Some(worst.map_or(m, |w| w.max(m)));
+        }
+    };
+    if unity {
+        // Bit-exact bypass: exactly [n0, n0 + b).
+        add(n0, n0 + b as u64);
+        // stretch → unity fade: one more streamed span_s block.
+        if ts.prev_unity == Some(false) && span_s > 0 && !ts.needs_anchor {
+            add(n0_s + in_lat, n0_s + in_lat + span_s);
+        }
+    } else {
+        // Stretch feed: [n0_s + input_latency, + span_s) (ADR-094 lead).
+        add(n0_s + in_lat, n0_s + in_lat + span_s);
+        if ts.needs_anchor {
+            // Anchor window: input+output latency frames ending at
+            // n0_s + input_latency (TrackState::anchor).
+            add(n0_s.saturating_sub(out_lat), n0_s + in_lat);
+        }
+        // Fade-out sources (one-block transitions, spec §3.2):
+        match (ts.prev_unity, ts.reanchor_fade_tempo) {
+            (Some(false), Some(old_tempo)) if ts.needs_anchor => {
+                // ADR-094 old-schedule fade: one final block at the OLD tempo.
+                let old_lead = out_lat as u128 * old_tempo as u128;
+                let a = ts.dictated_u(bu0 + old_lead);
+                let span_old = ((ts
+                    .dictated_u(bu0 + old_tempo as u128 * b as u128 + old_lead)
+                    - a) as usize)
+                    .min(MAX_FEED_FRAMES) as u64;
+                add(a + in_lat, a + in_lat + span_old);
+            }
+            (Some(prev), _) if prev || ts.needs_anchor => {
+                // 1:1 fade-out continuation from n0 (bypass→stretch, or a
+                // re-anchor with no warm stretch stream).
+                add(n0, n0 + b as u64);
+            }
+            _ => {}
+        }
+    }
+    worst
 }
 
 /// Render one active track into the mix. Free function so the borrow on the

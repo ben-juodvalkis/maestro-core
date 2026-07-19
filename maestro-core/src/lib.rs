@@ -48,6 +48,10 @@ pub mod validation;
 // PCM storage (validated lengths, Arc-shared with the audio core).
 pub mod pcm_cache;
 
+// Engine-resident PCM behind a monotone load frontier (ADR-112 §5.3) — the
+// one representation for bulk-loaded AND streaming track playback buffers.
+pub mod engine_pcm;
+
 // The Signalsmith C++ stretcher wrapper (native + wasm32 via the vendored
 // crate, spec §3.8). The legacy step-1..7 modules of the abandoned-roadmap
 // port (engine.rs facade, float beat timeline, FIFO frame readers, …) were

@@ -12,6 +12,8 @@ fn main() {
     maestro_api::Command::export_all_to(dir).unwrap();
     maestro_api::CommandResult::export_all_to(dir).unwrap();
     maestro_api::LoadMeta::export_all_to(dir).unwrap();
+    maestro_api::StreamLoadMeta::export_all_to(dir).unwrap();
+    maestro_api::AppendResult::export_all_to(dir).unwrap();
     maestro_api::Event::export_all_to(dir).unwrap();
     maestro_api::Snapshot::export_all_to(dir).unwrap();
 

@@ -150,6 +150,14 @@ pub enum Command {
     /// decode and call `load_pcm`, and the swap applies on load completion —
     /// `Event::VariationApplied` signals it either way.
     SwitchVariation { slot: u8, variation: u8 },
+    /// ADR-113: re-base the timeline epoch with a nonzero musical origin,
+    /// in beat-units (`K = 2_880_000_000` per beat). Valid only while the
+    /// transport is stopped (rejected otherwise). When `Play` later starts
+    /// the clock, positions derive from `bu` onward — a track activated
+    /// from timeline start enters its PCM at `u(bu)`, the host's
+    /// phase-matched mid-song entry for the persistent beat grid. An old
+    /// engine rejects this variant loudly at parse (§3.6).
+    SetTimelineOrigin { bu: u64 },
     /// FR17 (ADR-104): one-shot memory-pressure trim — evict PARKED (cached,
     /// non-installed) variation PCM, least-recently-audible first, until
     /// resident bytes ≤ `target_bytes`. Installed/audible PCM is never
@@ -234,6 +242,55 @@ pub struct LoadMeta {
     pub pan: f32,
 }
 
+/// Storage format for a track's engine-resident PCM (ADR-112 §6.2, Tier 2a).
+/// Audio-only: positions are storage-independent by construction. `I16`
+/// halves residency — the spec's pre-decided contingency (§4.11) — at a
+/// −96 dBFS quantization floor applied once at load. Default `F32` keeps
+/// today's digests byte-identical.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
+pub enum SampleFormat {
+    #[default]
+    F32,
+    I16,
+}
+
+/// Streaming load declaration (`begin_pcm_stream`, ADR-112 §5.1). The
+/// embedded [`LoadMeta`] is validated exactly as in `load_pcm`;
+/// `declared_total_samples` pre-declares the §3.4#4 reconciliation case so
+/// trimming can happen on the fly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
+pub struct StreamLoadMeta {
+    /// Identical contract to `load_pcm`'s meta (slot, sampleRate,
+    /// originalTempoMbpm, loopBeats, encoderDelay, endPadding,
+    /// originalSamples, variation, cacheOnly, gain, pan).
+    /// v1 restrictions: cacheOnly must be false; the slot must be Empty.
+    pub meta: LoadMeta,
+    /// Total samples per channel the host WILL append (its decoder's raw
+    /// output length). Must equal one of the three §3.4#4 reconciliation
+    /// shapes against `meta` — else begin is rejected. Finalize verifies
+    /// the host actually delivered exactly this many.
+    pub declared_total_samples: u64,
+    /// Tier 2a (ADR-112 §6.2): storage format for this track's resident PCM.
+    /// Omitted → F32.
+    #[serde(default)]
+    pub sample_format: SampleFormat,
+}
+
+/// `append_pcm_chunk` result (ADR-112 §5.1). `Ok` carries the post-append
+/// frontier so hosts get buffered-depth feedback per ack without a snapshot
+/// round-trip (the SAB snapshot only updates while the context renders).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
+pub enum AppendResult {
+    Ok { frontier: u64, complete: bool },
+    Rejected { reason: String },
+}
+
 /// Edge-triggered events drained via `drain_events_json`. JS state is cosmetic;
 /// a missed event can never desync anything (spec §3.5).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -277,6 +334,13 @@ pub enum Event {
     /// INSTALLED variation's loop length — per-variation since ADR-109, so
     /// the count re-bases (jumps) across a length-changing variation switch.
     LoopWrapped { slot: u8, wrap_count: u32 },
+    /// A streaming track's render was starved at the load frontier
+    /// (ADR-112 §5.4): it renders silence (DSP-skip) from `at_frame` until
+    /// the frontier passes the resume margin. `needed`/`frontier` are PCM
+    /// sample indices (diagnostics).
+    StreamStarved { slot: u8, at_frame: u64, needed: u64, frontier: u64 },
+    /// The starved track re-entered (re-anchor + activation ramp) at `at_frame`.
+    StreamResumed { slot: u8, at_frame: u64 },
     Underrun,
     BudgetExceeded { render_ns: u64, period_ns: u64 },
     /// The RT event queue overflowed and `dropped` edge events were lost
@@ -332,6 +396,13 @@ pub struct TrackSnap {
     pub rms_r: f32,
     pub peak_l: f32,
     pub peak_r: f32,
+    /// Load frontier in samples (ADR-112); == the PCM length for
+    /// complete/bulk-loaded tracks.
+    pub loaded_samples: u64,
+    /// True from `begin_pcm_stream` until finalize/abort.
+    pub streaming: bool,
+    /// True while the render is starved at the frontier (silent, ADR-112 §5.4).
+    pub starved: bool,
 }
 
 /// The only state egress (spec §3.5): written by the audio thread once per

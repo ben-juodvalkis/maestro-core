@@ -2,4 +2,4 @@
 // files. The backends assert this against the fingerprint embedded in the
 // engine artifact at init; mismatch or absence is a hard init failure.
 // Regenerate: cargo run -p maestro-api --features ts --bin gen-ts
-export const MAESTRO_SCHEMA_FINGERPRINT = 'maestro-schema-fp:v1:64591bb547297143';
+export const MAESTRO_SCHEMA_FINGERPRINT = 'maestro-schema-fp:v1:bf2c2f85d078937a';

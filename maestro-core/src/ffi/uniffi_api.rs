@@ -144,6 +144,46 @@ impl MaestroEngine {
         }
     }
 
+    /// `begin_pcm_stream` (ADR-112 §5.2): `meta_json` is a `maestro-api`
+    /// `StreamLoadMeta`; mirrors the wasm transport 1:1.
+    pub fn begin_pcm_stream(&self, meta_json: String) -> String {
+        let smeta: maestro_api::StreamLoadMeta = match serde_json::from_str(&meta_json) {
+            Ok(m) => m,
+            Err(e) => return rejected(format!("malformed stream meta: {e}")),
+        };
+        let mut control = self.control.lock().expect("control plane lock poisoned");
+        match control.begin_pcm_stream(&smeta) {
+            Ok(()) => json_result(maestro_api::CommandResult::Ok),
+            Err(reason) => rejected(reason),
+        }
+    }
+
+    /// `append_pcm_chunk` (ADR-112 §5.2): returns an `AppendResult` JSON;
+    /// the audio thread never touches the control-plane lock.
+    pub fn append_pcm_chunk(&self, slot: u8, seq: u32, left: Vec<f32>, right: Vec<f32>) -> String {
+        let mut control = self.control.lock().expect("control plane lock poisoned");
+        serde_json::to_string(&control.append_pcm_chunk(slot, seq, &left, &right))
+            .expect("AppendResult serializes")
+    }
+
+    /// `finalize_pcm_stream` (ADR-112 §5.5).
+    pub fn finalize_pcm_stream(&self, slot: u8) -> String {
+        let mut control = self.control.lock().expect("control plane lock poisoned");
+        match control.finalize_pcm_stream(slot) {
+            Ok(_) => json_result(maestro_api::CommandResult::Ok),
+            Err(reason) => rejected(reason),
+        }
+    }
+
+    /// `abort_pcm_stream` (ADR-112 §5.5).
+    pub fn abort_pcm_stream(&self, slot: u8) -> String {
+        let mut control = self.control.lock().expect("control plane lock poisoned");
+        match control.abort_pcm_stream(slot) {
+            Ok(()) => json_result(maestro_api::CommandResult::Ok),
+            Err(reason) => rejected(reason),
+        }
+    }
+
     /// The `AudioCore` pointer for direct rendering (`maestro_render`).
     /// Returns 0 once the pump has started — the two modes are exclusive.
     pub fn core_pointer(&self) -> u64 {

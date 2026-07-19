@@ -25,4 +25,17 @@ loopCount: number, loopProgress: number,
  * Per-track level metering over the last rendered block (post gain/pan,
  * the track's contribution to the mix). Zero while inaudible.
  */
-rmsL: number, rmsR: number, peakL: number, peakR: number, };
+rmsL: number, rmsR: number, peakL: number, peakR: number, 
+/**
+ * Load frontier in samples (ADR-112); == the PCM length for
+ * complete/bulk-loaded tracks.
+ */
+loadedSamples: bigint, 
+/**
+ * True from `begin_pcm_stream` until finalize/abort.
+ */
+streaming: boolean, 
+/**
+ * True while the render is starved at the frontier (silent, ADR-112 §5.4).
+ */
+starved: boolean, };

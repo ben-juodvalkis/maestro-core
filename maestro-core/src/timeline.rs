@@ -220,9 +220,22 @@ impl Timeline {
     /// transport stop and song switch. Musical position restarts at zero
     /// (bar 1 beat 1) from `at_frame`; earlier frames can no longer be queried.
     pub fn reset(&mut self, at_frame: u64, mbpm: u32) -> Result<(), TimelineError> {
+        self.reset_with_origin(at_frame, mbpm, 0)
+    }
+
+    /// Epoch reset with a nonzero musical origin (ADR-113): position at
+    /// `at_frame` becomes `origin_bu` instead of 0. Everything downstream
+    /// is the ordinary derivation — `bu(F)` continues linearly from the
+    /// origin; there is no seek state anywhere.
+    pub fn reset_with_origin(
+        &mut self,
+        at_frame: u64,
+        mbpm: u32,
+        origin_bu: u128,
+    ) -> Result<(), TimelineError> {
         Self::validate_tempo(mbpm)?;
         self.segments.clear();
-        self.segments.push(TempoSegment { start_frame: at_frame, start_bu: 0, mbpm });
+        self.segments.push(TempoSegment { start_frame: at_frame, start_bu: origin_bu, mbpm });
         self.epoch = self.epoch.wrapping_add(1);
         Ok(())
     }
