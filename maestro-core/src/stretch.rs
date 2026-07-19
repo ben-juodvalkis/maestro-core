@@ -32,9 +32,12 @@
 //!
 //! ## Feature gate
 //!
-//! This module is only compiled when the `native-stretch` feature is enabled.
-//! On WASM targets, the existing JavaScript/WASM Signalsmith pipeline handles
-//! time-stretching in the AudioWorklet — see Phase 4 of the Hybrid Migration Roadmap.
+//! The `Stretcher` wrapper is compiled only under the `native-stretch` feature,
+//! which builds the Signalsmith C++ for native AND wasm32 targets (the vendored
+//! crate compiles the same source via wasi-sdk; M4, spec §3.8). The *module* is
+//! ungated on purpose: `StretchError` and the ratio/semitone helpers below are
+//! pure Rust and stay available to the no-default-features build that
+//! `maestro-validate` resolves (ADR-114).
 
 #[cfg(feature = "native-stretch")]
 use signalsmith_stretch::Stretch;
@@ -79,8 +82,6 @@ pub enum StretchError {
     InvalidSemitones(f32),
     /// Empty audio data provided.
     EmptyAudio,
-    /// Feature not available (native-stretch not compiled).
-    NotAvailable,
 }
 
 impl std::fmt::Display for StretchError {
@@ -92,7 +93,6 @@ impl std::fmt::Display for StretchError {
             Self::InvalidRatio(r) => write!(f, "invalid stretch ratio: {r}"),
             Self::InvalidSemitones(s) => write!(f, "invalid semitones: {s}"),
             Self::EmptyAudio => write!(f, "empty audio data"),
-            Self::NotAvailable => write!(f, "native stretch not available (compile with native-stretch feature)"),
         }
     }
 }
@@ -473,116 +473,6 @@ impl std::fmt::Debug for Stretcher {
             .field("current_semitones", &self.current_semitones)
             .field("input_latency", &self.input_latency())
             .field("output_latency", &self.output_latency())
-            .finish()
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Stub implementation (no native-stretch feature)
-// ---------------------------------------------------------------------------
-
-/// Stub stretcher for WASM builds where native Signalsmith is not available.
-///
-/// All processing methods return `StretchError::NotAvailable`.
-/// The web platform uses the existing JavaScript/WASM Signalsmith pipeline instead.
-#[cfg(not(feature = "native-stretch"))]
-pub struct Stretcher {
-    channels: u32,
-    sample_rate: u32,
-}
-
-#[cfg(not(feature = "native-stretch"))]
-impl Stretcher {
-    pub fn new(channels: u32, sample_rate: u32) -> Self {
-        Self { channels, sample_rate }
-    }
-
-    pub fn new_cheaper(channels: u32, sample_rate: u32) -> Self {
-        Self { channels, sample_rate }
-    }
-
-    pub fn channels(&self) -> u32 {
-        self.channels
-    }
-
-    pub fn sample_rate(&self) -> u32 {
-        self.sample_rate
-    }
-
-    pub fn current_semitones(&self) -> f32 {
-        0.0
-    }
-
-    pub fn is_unity(&self) -> bool {
-        true
-    }
-
-    pub fn set_transpose_semitones(&mut self, _semitones: f32) -> Result<(), StretchError> {
-        Err(StretchError::NotAvailable)
-    }
-
-    pub fn set_transpose_factor(&mut self, _factor: f32) -> Result<(), StretchError> {
-        Err(StretchError::NotAvailable)
-    }
-
-    pub fn set_combined_pitch(
-        &mut self,
-        _compensation_semitones: f32,
-        _offset_semitones: f32,
-    ) -> Result<(), StretchError> {
-        Err(StretchError::NotAvailable)
-    }
-
-    pub fn reset(&mut self) {}
-
-    pub fn input_latency(&self) -> usize {
-        0
-    }
-
-    pub fn output_latency(&self) -> usize {
-        0
-    }
-
-    pub fn total_latency(&self) -> usize {
-        0
-    }
-
-    pub fn total_latency_seconds(&self) -> f64 {
-        0.0
-    }
-
-    pub fn process_separated(
-        &mut self,
-        _input_channels: &[&[f32]],
-        _output_frames: usize,
-    ) -> Result<Vec<Vec<f32>>, StretchError> {
-        Err(StretchError::NotAvailable)
-    }
-
-    pub fn process_interleaved(
-        &mut self,
-        _input: &[f32],
-        _output: &mut [f32],
-    ) -> Result<(), StretchError> {
-        Err(StretchError::NotAvailable)
-    }
-
-    pub fn seek(&mut self, _input_channels: &[&[f32]], _playback_rate: f64) -> Result<(), StretchError> {
-        Err(StretchError::NotAvailable)
-    }
-
-    pub fn flush(&mut self) -> Vec<Vec<f32>> {
-        Vec::new()
-    }
-}
-
-#[cfg(not(feature = "native-stretch"))]
-impl std::fmt::Debug for Stretcher {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Stretcher")
-            .field("channels", &self.channels)
-            .field("sample_rate", &self.sample_rate)
-            .field("available", &false)
             .finish()
     }
 }
@@ -1030,39 +920,6 @@ mod tests {
 
             assert!((s1.current_semitones() - 5.0).abs() < 0.001);
             assert!((s2.current_semitones() - (-3.0)).abs() < 0.001);
-        }
-    }
-
-    // -- Stub tests (when native-stretch is NOT available) --
-
-    #[cfg(not(feature = "native-stretch"))]
-    mod stub_tests {
-        use super::*;
-
-        #[test]
-        fn test_stub_returns_not_available() {
-            let mut s = Stretcher::new(2, 48000);
-            assert!(matches!(
-                s.set_transpose_semitones(5.0),
-                Err(StretchError::NotAvailable)
-            ));
-            assert!(matches!(
-                s.process_separated(&[], 128),
-                Err(StretchError::NotAvailable)
-            ));
-        }
-
-        #[test]
-        fn test_stub_is_always_unity() {
-            let s = Stretcher::new(2, 48000);
-            assert!(s.is_unity());
-            assert_eq!(s.current_semitones(), 0.0);
-        }
-
-        #[test]
-        fn test_stub_latency_is_zero() {
-            let s = Stretcher::new(2, 48000);
-            assert_eq!(s.total_latency(), 0);
         }
     }
 }
