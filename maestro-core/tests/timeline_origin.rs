@@ -8,7 +8,7 @@
 mod common;
 
 use common::{make_sine_pcm, SAMPLE_RATE};
-use maestro_api::{Command, CommandResult, EngineConfig, LoadMeta, QuantizePolicy};
+use maestro_api::{Command, CommandResult, EngineConfig, LoadMeta, QuantizePolicy, SampleFormat};
 use maestro_core::audio_core::{AudioCore, ACTIVATION_RAMP_FRAMES};
 use maestro_core::control_plane::{create_engine, ControlPlane};
 use maestro_core::timeline::BEAT_UNITS_PER_BEAT;
@@ -37,7 +37,7 @@ fn engine_with_track() -> (ControlPlane, Box<AudioCore>) {
                 end_padding: 0,
                 original_samples: PCM_120,
                 variation: 0,
-                cache_only: false,
+                cache_only: false, sample_format: SampleFormat::F32,
                 gain: 1.0,
                 pan: 0.0,
             },

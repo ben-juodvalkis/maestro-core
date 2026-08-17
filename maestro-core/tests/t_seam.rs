@@ -27,7 +27,7 @@ use common::validation_thresholds::{
     ONSET_THRESHOLD, SEAM_STEP_FACTOR, STRETCH_GRID_MEDIAN_MAX, STRETCH_ONSET_JITTER_MAX,
 };
 use common::{detect_click_onsets, fixture_path, load_float_wav, make_sine_pcm, SAMPLE_RATE};
-use maestro_api::{Command, CommandResult, EngineConfig, LoadMeta};
+use maestro_api::{Command, CommandResult, EngineConfig, LoadMeta, SampleFormat};
 use maestro_core::control_plane::create_engine;
 use maestro_core::timeline::BEAT_UNITS_PER_BEAT;
 
@@ -83,7 +83,7 @@ fn render_capture_with_changes(
     .unwrap();
     plane
         .load_pcm(
-            &LoadMeta { cache_only: false,
+            &LoadMeta { cache_only: false, sample_format: SampleFormat::F32,
                 sample_rate: 48_000,
                 slot: 0,
                 original_tempo_mbpm: O_MBPM,

@@ -17,7 +17,7 @@
 mod common;
 
 use common::{make_sine_pcm, SAMPLE_RATE};
-use maestro_api::{Command, CommandResult, EngineConfig, Event, LoadMeta, QuantizePolicy};
+use maestro_api::{Command, CommandResult, EngineConfig, Event, LoadMeta, QuantizePolicy, SampleFormat};
 use maestro_core::control_plane::{create_engine, ControlPlane};
 use maestro_core::audio_core::AudioCore;
 
@@ -46,7 +46,7 @@ fn engine_with_sine(tempo: u32, hz: f32) -> (ControlPlane, Box<AudioCore>) {
 }
 
 fn meta(slot: u8, variation: u8) -> LoadMeta {
-    LoadMeta { cache_only: false,
+    LoadMeta { cache_only: false, sample_format: SampleFormat::F32,
         sample_rate: 48_000,
         slot,
         original_tempo_mbpm: O_MBPM,
@@ -231,7 +231,7 @@ fn tempo_and_load_reject_out_of_range_rates() {
     let (l, r) = make_sine_pcm(768_000, 110.0);
     plane
         .load_pcm(
-            &LoadMeta { cache_only: false,
+            &LoadMeta { cache_only: false, sample_format: SampleFormat::F32,
                 sample_rate: 48_000,
                 slot: 1,
                 original_tempo_mbpm: 60_000,
@@ -263,7 +263,7 @@ fn tempo_and_load_reject_out_of_range_rates() {
     // Loading a track whose rate at the CURRENT tempo is out of range fails.
     let (l2, r2) = make_sine_pcm(192_000, 880.0);
     let res = plane.load_pcm(
-        &LoadMeta { cache_only: false,
+        &LoadMeta { cache_only: false, sample_format: SampleFormat::F32,
             sample_rate: 48_000,
             slot: 2,
             original_tempo_mbpm: 240_000, // rate at tempo 240k is 1.0 — fine…
@@ -281,7 +281,7 @@ fn tempo_and_load_reject_out_of_range_rates() {
     assert!(res.is_ok(), "in-range load must pass: {res:?}");
     let (l3, r3) = make_sine_pcm(1_536_000, 55.0);
     let res = plane.load_pcm(
-        &LoadMeta { cache_only: false,
+        &LoadMeta { cache_only: false, sample_format: SampleFormat::F32,
             sample_rate: 48_000,
             slot: 3,
             original_tempo_mbpm: 30_000, // rate at tempo 240k would be 8.0

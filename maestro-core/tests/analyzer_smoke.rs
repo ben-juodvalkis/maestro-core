@@ -17,7 +17,7 @@
 mod common;
 
 use common::{fixture_path, load_float_wav, SAMPLE_RATE};
-use maestro_api::{Command, CommandResult, EngineConfig, LoadMeta};
+use maestro_api::{Command, CommandResult, EngineConfig, LoadMeta, SampleFormat};
 use maestro_core::control_plane::create_engine;
 use maestro_core::validation::write_float_wav_stereo;
 use std::path::PathBuf;
@@ -51,7 +51,7 @@ fn render_scenario(stems: &[Stem], out_name: &str) {
         assert_eq!(wav.sample_rate, SAMPLE_RATE);
         plane
             .load_pcm(
-                &LoadMeta { cache_only: false,
+                &LoadMeta { cache_only: false, sample_format: SampleFormat::F32,
                     sample_rate: 48_000,
                     slot: slot as u8,
                     original_tempo_mbpm: stem.o_mbpm,
@@ -205,7 +205,7 @@ fn render_timing_script(script: &TimingScript, out_name: &str, report_name: &str
         let wav = load_float_wav(&fixture_path(stem.fixture)).unwrap();
         plane
             .load_pcm(
-                &LoadMeta { cache_only: false,
+                &LoadMeta { cache_only: false, sample_format: SampleFormat::F32,
                     sample_rate: 48_000,
                     slot: slot as u8,
                     original_tempo_mbpm: stem.o_mbpm,
@@ -266,7 +266,7 @@ fn render_timing_script(script: &TimingScript, out_name: &str, report_name: &str
             T_VARIATION => {
                 plane
                     .load_pcm(
-                        &LoadMeta { cache_only: false,
+                        &LoadMeta { cache_only: false, sample_format: SampleFormat::F32,
                             sample_rate: 48_000,
                             slot: 0,
                             original_tempo_mbpm: script.var_o_mbpm,
@@ -389,7 +389,7 @@ fn render_control_scenario(out_name: &str, report_name: &str) {
         let wav = load_float_wav(&fixture_path(stem.fixture)).unwrap();
         plane
             .load_pcm(
-                &LoadMeta { cache_only: false,
+                &LoadMeta { cache_only: false, sample_format: SampleFormat::F32,
                     sample_rate: 48_000,
                     slot: slot as u8,
                     original_tempo_mbpm: stem.o_mbpm,
@@ -481,7 +481,7 @@ fn render_control_scenario(out_name: &str, report_name: &str) {
             if let maestro_api::Event::VariationLoadRequired { slot, variation } = e {
                 plane
                     .load_pcm(
-                        &LoadMeta { cache_only: false,
+                        &LoadMeta { cache_only: false, sample_format: SampleFormat::F32,
                             sample_rate: 48_000,
                             slot,
                             original_tempo_mbpm: 60_000,
@@ -584,7 +584,7 @@ fn render_soak_edition(ed: &SoakEdition) {
         let wav = load_float_wav(&fixture_path(stem.fixture)).unwrap();
         plane
             .load_pcm(
-                &LoadMeta { cache_only: false,
+                &LoadMeta { cache_only: false, sample_format: SampleFormat::F32,
                     sample_rate: 48_000,
                     slot: slot as u8,
                     original_tempo_mbpm: stem.o_mbpm,

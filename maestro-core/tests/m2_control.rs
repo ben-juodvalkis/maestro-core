@@ -19,10 +19,8 @@
 mod common;
 
 use common::{make_sine_pcm, SAMPLE_RATE};
-use maestro_api::{
-    Command, CommandResult, EngineConfig, Event, LoadMeta, QuantizePolicy, TransportPolicy,
-    TransportState,
-};
+use maestro_api::{Command, CommandResult, EngineConfig, Event, LoadMeta, QuantizePolicy, TransportPolicy,
+    TransportState, SampleFormat};
 use maestro_core::audio_core::AudioCore;
 use maestro_core::control_plane::{create_engine, ControlPlane, PCM_BUDGET_BYTES};
 
@@ -32,7 +30,7 @@ const PCM_LEN: u64 = 384_000;
 const BLOCK: usize = 480;
 
 fn meta(slot: u8, variation: u8) -> LoadMeta {
-    LoadMeta { cache_only: false,
+    LoadMeta { cache_only: false, sample_format: SampleFormat::F32,
         slot,
         sample_rate: SAMPLE_RATE,
         original_tempo_mbpm: O_MBPM,
@@ -421,7 +419,7 @@ fn eviction_above_budget_never_touches_the_installed_variation() {
         beats_per_bar: 4,
     })
     .unwrap();
-    let long_meta = |variation: u8| LoadMeta { cache_only: false,
+    let long_meta = |variation: u8| LoadMeta { cache_only: false, sample_format: SampleFormat::F32,
         slot: 0,
         sample_rate: SAMPLE_RATE,
         original_tempo_mbpm: 60_000,

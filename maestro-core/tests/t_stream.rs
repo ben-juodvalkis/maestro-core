@@ -50,7 +50,7 @@ fn meta_120(slot: u8, encoder_delay: u32, end_padding: u32) -> LoadMeta {
         end_padding,
         original_samples: PCM_120,
         variation: 0,
-        cache_only: false,
+        cache_only: false, sample_format: SampleFormat::F32,
         gain: 1.0,
         pan: 0.0,
     }
@@ -485,7 +485,7 @@ fn stretch_at_4x_rate_demands_the_compensated_lead() {
         end_padding: 0,
         original_samples: pcm_len,
         variation: 0,
-        cache_only: false,
+        cache_only: false, sample_format: SampleFormat::F32,
         gain: 1.0,
         pan: 0.0,
     };

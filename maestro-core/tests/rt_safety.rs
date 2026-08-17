@@ -72,7 +72,7 @@ fn streaming_render_and_reclaim_never_allocate() {
                 end_padding: 0,
                 original_samples: pcm_len,
                 variation: 0,
-                cache_only: false,
+                cache_only: false, sample_format: SampleFormat::F32,
                 gain: 1.0,
                 pan: 0.0,
             },

@@ -22,7 +22,7 @@
 mod common;
 
 use common::{make_sine_pcm, SAMPLE_RATE};
-use maestro_api::{Command, CommandResult, Event, EngineConfig, LoadMeta, QuantizePolicy, TransportPolicy};
+use maestro_api::{Command, CommandResult, Event, EngineConfig, LoadMeta, QuantizePolicy, TransportPolicy, SampleFormat};
 use maestro_core::audio_core::AudioCore;
 use maestro_core::control_plane::{create_engine, ControlPlane};
 
@@ -43,6 +43,7 @@ fn meta(slot: u8, variation: u8, cache_only: bool) -> LoadMeta {
         original_samples: PCM_LEN,
         variation,
         cache_only,
+        sample_format: SampleFormat::F32,
         gain: 1.0,
         pan: 0.0,
     }

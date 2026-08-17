@@ -13,7 +13,7 @@ pub mod validation_thresholds;
 
 use std::path::PathBuf;
 
-use maestro_api::{Command, EngineConfig, Event, LoadMeta, QuantizePolicy};
+use maestro_api::{Command, EngineConfig, Event, LoadMeta, QuantizePolicy, SampleFormat};
 use maestro_core::audio_core::AudioCore;
 use maestro_core::control_plane::{create_engine, ControlPlane};
 
@@ -133,7 +133,7 @@ pub fn build_engine_select(
         let (l, r) = make_sine_pcm(t.pcm_len, t.sine_hz);
         plane
             .load_pcm(
-                &LoadMeta { cache_only: false,
+                &LoadMeta { cache_only: false, sample_format: SampleFormat::F32,
                     sample_rate: 48_000,
                     slot: slot as u8,
                     original_tempo_mbpm: t.o_mbpm,

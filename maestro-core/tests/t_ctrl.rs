@@ -20,7 +20,7 @@ mod common;
 
 use common::reference::RefTimeline;
 use common::{build_engine_select, make_sine_pcm, T_INV_TRACKS};
-use maestro_api::{Command, CommandResult, Event, LoadMeta, QuantizePolicy, TransportPolicy};
+use maestro_api::{Command, CommandResult, Event, LoadMeta, QuantizePolicy, TransportPolicy, SampleFormat};
 use num_bigint::BigUint;
 
 const TOTAL_FRAMES: u64 = 10_000_000;
@@ -113,7 +113,7 @@ fn storm(seed: u64) {
         let (l, r) = make_sine_pcm(len, 220.0 * (variation as f32 + 1.0));
         plane
             .load_pcm(
-                &LoadMeta { cache_only: false,
+                &LoadMeta { cache_only: false, sample_format: SampleFormat::F32,
                     slot: slot as u8,
                     sample_rate: 48_000,
                     original_tempo_mbpm: t.o_mbpm,

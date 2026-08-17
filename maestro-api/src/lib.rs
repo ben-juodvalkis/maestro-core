@@ -240,6 +240,21 @@ pub struct LoadMeta {
     /// completes that switch instead. A park never touches the RT thread.
     #[serde(default)]
     pub cache_only: bool,
+    /// Storage format for this load's resident PCM (ADR-119 FR1; the same
+    /// knob `StreamLoadMeta` has carried since ADR-112 Tier 2a). Omitted →
+    /// `F32`, so every existing load and every existing digest is
+    /// byte-unchanged.
+    ///
+    /// Legal as a serde-defaulted field under the §3.6 evolution law: an
+    /// engine that ignores it stores f32 — higher residency, more LRU
+    /// eviction, a slower switch. Degraded, never corrupted, and never a
+    /// destroyed track. (Contrast `cache_only`, which flips a call between
+    /// destructive and non-destructive and therefore may NOT ride a default.)
+    /// The fingerprint handshake closes the class regardless: adding this
+    /// field moves `SCHEMA_FINGERPRINT`, so a mismatched bundle and engine
+    /// fail init hard rather than silently reinterpreting.
+    #[serde(default)]
+    pub sample_format: SampleFormat,
     /// Initial gain/pan (same validation as SetGain/SetPan).
     pub gain: f32,
     pub pan: f32,

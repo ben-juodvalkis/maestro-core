@@ -32,7 +32,7 @@ use std::fs::File;
 use std::path::Path;
 
 use common::{detect_click_onsets, fixture_path, load_float_wav, make_sine_pcm, SAMPLE_RATE};
-use maestro_api::{Command, CommandResult, EngineConfig, Event, LoadMeta, QuantizePolicy};
+use maestro_api::{Command, CommandResult, EngineConfig, Event, LoadMeta, QuantizePolicy, SampleFormat};
 use maestro_core::control_plane::{create_engine, ControlPlane, Reconciliation};
 use maestro_core::audio_core::AudioCore;
 
@@ -70,7 +70,7 @@ fn engine() -> (ControlPlane, Box<AudioCore>) {
 }
 
 fn meta(slot: u8, variation: u8, original_samples: u64) -> LoadMeta {
-    LoadMeta { cache_only: false,
+    LoadMeta { cache_only: false, sample_format: SampleFormat::F32,
         slot,
         sample_rate: SAMPLE_RATE,
         original_tempo_mbpm: M4A_O_MBPM,
@@ -411,7 +411,7 @@ fn non_48k_file_fails_loudly() {
     );
 
     let (mut plane, _core) = engine();
-    let mut m = LoadMeta { cache_only: false,
+    let mut m = LoadMeta { cache_only: false, sample_format: SampleFormat::F32,
         slot: 0,
         sample_rate: rate,
         original_tempo_mbpm: M4A_O_MBPM,

@@ -23,7 +23,7 @@
 use std::sync::Arc;
 
 use maestro_api::{
-    AppendResult, Command, CommandResult, EngineConfig, Event, LoadMeta, SampleFormat, Snapshot,
+    AppendResult, Command, CommandResult, EngineConfig, Event, LoadMeta, Snapshot,
     StreamLoadMeta, TrackSnap, TrackStatus, TransportPolicy, TransportState,
 };
 
@@ -263,12 +263,21 @@ fn build_complete_pcm(
     left: Vec<f32>,
     right: Vec<f32>,
 ) -> EnginePcm {
+    // ADR-119 FR2: the HOST declares the storage format; the engine never
+    // decides it (FR3 — the default stays F32, so every existing load and
+    // every existing digest is byte-unchanged).
+    let format = meta.sample_format;
     if reconciliation == Reconciliation::AlreadyTrimmed {
-        return EnginePcm::new_complete(left, right, SampleFormat::F32);
+        // The f32 case keeps its ZERO-COPY Vec takeover — the host's buffers
+        // become the engine's storage untouched. Only i16 pays a conversion,
+        // and `new_complete` quantizes in the same one pass it already uses
+        // for the streaming path (engine_pcm.rs), on the control-plane
+        // thread. Never on the RT path.
+        return EnginePcm::new_complete(left, right, format);
     }
     let d = keep_window_start(reconciliation, meta) as usize;
     let keep = meta.original_samples as usize;
-    let pcm = EnginePcm::new_streaming(meta.original_samples, SampleFormat::F32);
+    let pcm = EnginePcm::new_streaming(meta.original_samples, format);
     pcm.append(0, &left[d..d + keep], &right[d..d + keep]);
     pcm.mark_complete();
     pcm
@@ -685,7 +694,19 @@ impl ControlPlane {
             let smeta = StreamLoadMeta {
                 meta: meta.clone(),
                 declared_total_samples: l_dec,
-                sample_format: SampleFormat::F32,
+                // ADR-119 FR2: carry the bulk meta's format through, do NOT
+                // re-hardcode F32 here. A fresh install is the streaming
+                // composition (ADR-112 §5.3), so this branch is where the
+                // INSTALLED variation's storage is actually decided —
+                // `build_complete_pcm` below only ever sees occupied slots
+                // (swaps and §4.11 parks).
+                //
+                // Missing this leaves installs f32 while parks are i16, which
+                // is precisely PRD §3.1's rejected Option A arriving by
+                // accident: the accounting only half-halves, and one user
+                // switch makes the formats trade places (the parked buffer
+                // BECOMES the installed one, with no re-expansion anywhere).
+                sample_format: meta.sample_format,
             };
             self.begin_stream_inner(&smeta)?;
             // A failed append on the just-begun stream tears it down so the
