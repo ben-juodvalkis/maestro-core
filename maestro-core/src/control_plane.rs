@@ -711,10 +711,11 @@ impl ControlPlane {
         // is variation-independent and a switch resumes at the same global
         // musical position) AND reconcile the same way (spec §3.4#4).
         if let SlotState::Loaded(l) = &self.slots[meta.slot as usize] {
-            // Shared-identity + reconciliation-stability validation also
-            // applies to §4.11 cache-only prewarms — a mismatch means a
+            // Shared-identity + reconciliation-stability validation applies
+            // to EVERY load onto an occupied slot — §4.11 cache-only prewarms
+            // and same-variation reloads included: a mismatch means a
             // mis-tagged or mis-decoded file, never a curiosity.
-            if l.variation != meta.variation || meta.cache_only {
+            {
                 if l.o_mbpm != meta.original_tempo_mbpm {
                     return Err(format!(
                         "variation {} identity mismatch on slot {}: installed O={} vs \
@@ -814,6 +815,35 @@ impl ControlPlane {
                 // ADR-098).
                 return Ok(reconciliation);
             }
+            // FULL load of the INSTALLED variation — the async-switch
+            // dedupe-loser (ADR-098's other half): a §4.11 park completed
+            // the pending switch first and the platform's answer load lands
+            // late, now targeting the current variation. Falling through to
+            // the fresh-install path would replace the LIVE TrackState with
+            // an inactive one: a playing track dies silently — no
+            // Deactivated/Removed event ever fires, so the UI keeps showing
+            // it as playing while it renders nothing (the "silent variation
+            // switch" bake-watch item, ADR-096) — and the slot's §4.11 cache
+            // is wiped. Refresh the content through the swap path instead:
+            // identical derived position, live state (active/mute/solo/
+            // pitch/live gain) preserved, one inaudible same-content
+            // crossfade. Identity + map equality were validated above, so
+            // the incoming buffer is interchangeable with the installed one.
+            self.send(RtCommand::SwapVariation {
+                slot: meta.slot,
+                variation: meta.variation,
+                pcm: Arc::clone(&pcm),
+                map,
+            })?;
+            let SlotState::Loaded(l) = &mut self.slots[meta.slot as usize] else {
+                unreachable!()
+            };
+            l.current_pcm = pcm;
+            l.map = map;
+            if l.pending_variation == Some(meta.variation) {
+                l.pending_variation = None;
+            }
+            return Ok(reconciliation);
         }
 
         // §4.11 prewarm requires an installed track — there is nothing to
