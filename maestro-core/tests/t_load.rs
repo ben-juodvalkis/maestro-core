@@ -131,7 +131,7 @@ fn decode_m4a(path: &Path, gapless: bool) -> (Vec<f32>, Vec<f32>, u32) {
             spec,
         );
         buf.copy_interleaved_ref(decoded);
-        for frame in buf.samples().chunks_exact(2) {
+        for frame in buf.samples().as_chunks::<2>().0 {
             left.push(frame[0]);
             right.push(frame[1]);
         }
